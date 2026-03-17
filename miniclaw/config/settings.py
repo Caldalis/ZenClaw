@@ -1,12 +1,4 @@
 """
-配置模型 — 对标 OpenClaw 的 Settings / AppConfig
-
-OpenClaw 使用 TypeScript 的接口 + 环境变量来管理配置。
-这里用 Pydantic Settings 实现相同功能：
-  1. 支持 YAML 文件配置
-  2. 支持环境变量覆盖（前缀 MINICLAW_）
-  3. 类型安全 + 默认值
-
 层级:  默认值 < YAML 文件 < 环境变量
 """
 
