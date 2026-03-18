@@ -77,11 +77,11 @@ class WeatherSkill(Skill):
             condition = _weather_code_to_text(code)
 
             return (
-                f"📍 {city_name}, {country}\n"
-                f"🌡️ 温度: {temp}°C\n"
-                f"💧 湿度: {humidity}%\n"
-                f"💨 风速: {wind} km/h\n"
-                f"🌤️ 天气: {condition}"
+                f"{city_name}, {country}\n"
+                f"温度: {temp}°C\n"
+                f"湿度: {humidity}%\n"
+                f"风速: {wind} km/h\n"
+                f"天气: {condition}"
             )
 
 
