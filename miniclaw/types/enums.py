@@ -13,4 +13,13 @@ class Role(str, Enum):
     USER = "user"            # 用户输入
     ASSISTANT = "assistant"  # AI 回复
     TOOL = "tool"            # 工具调用结果
+class ChannelType(str, Enum):
+    """通道类型"""
+    CLI = "cli"          # 命令行终端
+    WEBSOCKET = "ws"     # WebSocket 远程客户端
 
+
+class ProviderType(str, Enum):
+    """AI 提供商类型 — 对标 OpenClaw 的 LLM Provider"""
+    OPENAI = "openai"
+    ANTHROPIC = "anthropic"
