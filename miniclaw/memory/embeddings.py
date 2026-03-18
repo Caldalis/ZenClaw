@@ -22,9 +22,9 @@ class EmbeddingGenerator:
         self._client = None
 
     def _get_client(self):
-
-        from openai import AsyncOpenAI
-        self._client = AsyncOpenAI(api_key=self._api_key, base_url=self._base_url)
+        if self._client is None:
+            from openai import AsyncOpenAI
+            self._client = AsyncOpenAI(api_key=self._api_key, base_url=self._base_url)
         return self._client
 
     async def embed(self, text: str) -> np.ndarray:
