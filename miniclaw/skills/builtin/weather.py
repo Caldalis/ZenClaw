@@ -21,15 +21,15 @@ WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
 class WeatherSkill(Skill):
     """天气查询 — 查询指定城市的当前天气"""
 
-
+    @property
     def name(self) -> str:
         return "weather"
 
-
+    @property
     def description(self) -> str:
         return "查询指定城市的当前天气信息，包括温度、湿度、风速等。"
 
-
+    @property
     def parameters(self) -> dict[str, Any]:
         return {
             "type": "object",
