@@ -40,5 +40,25 @@ class EmbeddingGenerator:
 
     async def embed_batch(self, texts: list[str]) -> list[np.ndarray]:
         """批量生成嵌入向量
+
+        OpenAI API 支持一次传入多段文本，减少 HTTP 请求次数。
         """
-        pass
+        if not texts:
+            return []
+        client = self._get_client()
+        response = await client.embeddings.create(input=texts, model=self._model)
+        return [np.array(d.embedding, dtype=np.float32) for d in response.data]
+
+
+def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    """计算两个向量的余弦相似度
+
+    余弦相似度 = (A · B) / (|A| × |B|)
+    值域 [-1, 1]，越接近 1 表示越相似。
+    """
+    dot = np.dot(a, b)
+    norm_a = np.linalg.norm(a)
+    norm_b = np.linalg.norm(b)
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return float(dot / (norm_a * norm_b))
