@@ -1,6 +1,5 @@
 """
 嵌入向量生成
-test
 """
 
 from __future__ import annotations
