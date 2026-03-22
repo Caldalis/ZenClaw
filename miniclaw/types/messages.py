@@ -1,6 +1,5 @@
 """
 消息数据模型
-test
 """
 
 from __future__ import annotations
@@ -50,3 +49,17 @@ class Message(BaseModel):
         """是否包含工具调用请求"""
         return bool(self.tool_calls)
 
+    def token_estimate(self) -> int:
+        """粗略估算 token 数（1 token ≈ 4 字符，中文 ≈ 2 字符）
+
+        用于上下文窗口管理，不需要精确值。
+        """
+        text = self.content
+        if self.tool_calls:
+            text += str(self.tool_calls)
+        if self.tool_result:
+            text += self.tool_result.content
+        # 简单启发式: ASCII 字符 / 4, 非 ASCII / 2
+        ascii_chars = sum(1 for c in text if ord(c) < 128)
+        non_ascii = len(text) - ascii_chars
+        return ascii_chars // 4 + non_ascii // 2 + 1
