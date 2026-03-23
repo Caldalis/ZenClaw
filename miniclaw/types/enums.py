@@ -1,7 +1,6 @@
 """
 枚举定义
 str + Enum 实现相同语义，同时兼容 JSON 序列化。
-test
 """
 
 from enum import Enum
@@ -13,19 +12,13 @@ class Role(str, Enum):
     USER = "user"            # 用户输入
     ASSISTANT = "assistant"  # AI 回复
     TOOL = "tool"            # 工具调用结果
-class ChannelType(str, Enum):
-    """通道类型"""
-    CLI = "cli"          # 命令行终端
-    WEBSOCKET = "ws"     # WebSocket 远程客户端
 
-
-class ProviderType(str, Enum):
-    """AI 提供商类型 — 对标 OpenClaw 的 LLM Provider"""
-    OPENAI = "openai"
-    ANTHROPIC = "anthropic"
 
 class EventType(str, Enum):
-    """事件类型
+    """事件类型 — 对标 OpenClaw 的 EventType
+
+    事件驱动是 OpenClaw 的核心模式：Agent 处理消息后不直接返回字符串，
+    而是产出一系列 Event，让上层（Gateway/Channel）决定如何呈现。
     """
     # 流式输出事件
     TEXT_DELTA = "text_delta"          # 文本片段（流式）
@@ -37,3 +30,21 @@ class EventType(str, Enum):
     THINKING = "thinking"              # AI 正在思考
     ERROR = "error"                    # 错误
     DONE = "done"                      # 处理完成
+
+
+class ChannelType(str, Enum):
+    """通道类型"""
+    CLI = "cli"          # 命令行终端
+    WEBSOCKET = "ws"     # WebSocket 远程客户端
+
+
+class ProviderType(str, Enum):
+    """AI 提供商类型 — 对标 OpenClaw 的 LLM Provider"""
+    OPENAI = "openai"
+    ANTHROPIC = "anthropic"
+
+
+class SessionStatus(str, Enum):
+    """会话状态"""
+    ACTIVE = "active"
+    ARCHIVED = "archived"
