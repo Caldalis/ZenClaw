@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from miniclaw.skills.base import Skill
+from miniclaw.tools.base import Skill
 
 
 class WebSearchSkill(Skill):

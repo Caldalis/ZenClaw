@@ -9,7 +9,7 @@ from typing import Any
 
 import httpx
 
-from miniclaw.skills.base import Skill
+from miniclaw.tools.base import Skill
 
 
 # Open-Meteo 地理编码 API
