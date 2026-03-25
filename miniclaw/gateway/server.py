@@ -17,7 +17,7 @@ import json
 from typing import Any
 
 import websockets
-from websockets.asyncio.server import ServerConnection
+from websockets.asyncio.server import ServerConnection, serve
 
 from miniclaw.agents.agent import Agent
 from miniclaw.config.settings import GatewayConfig
@@ -54,7 +54,7 @@ class GatewayServer:
 
     async def start(self) -> None:
         """启动 WebSocket 服务器"""
-        self._server = await websockets.asyncio.serve(
+        self._server = await serve(
             self._handle_connection,
             self._config.host,
             self._config.port,

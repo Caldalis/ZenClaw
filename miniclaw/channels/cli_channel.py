@@ -24,7 +24,7 @@ from miniclaw.sessions.manager import SessionManager
 from miniclaw.types.enums import EventType, Role
 from miniclaw.types.messages import Message
 from miniclaw.utils.logging import get_logger
-
+from datetime import datetime
 from .base import Channel
 
 logger = get_logger(__name__)
@@ -37,7 +37,7 @@ class CLIChannel(Channel):
         self._agent = agent
         self._session_mgr = session_manager
         self._running = False
-        self._session_id: str | None = None
+
 
     @property
     def name(self) -> str:
@@ -108,7 +108,8 @@ class CLIChannel(Channel):
                     break
 
                 if user_input.lower() == "/new":
-                    session = await self._session_mgr.create_session(title="CLI 会话")
+                    current_time = datetime.now().strftime("%Y-%m-%d %H:%M")
+                    session = await self._session_mgr.create_session(title=f"CLI 会话 {current_time}")
                     self._session_id = session.id
                     if use_rich:
                         console.print(f"[dim]新会话: {session.id[:8]}[/dim]")
@@ -120,7 +121,7 @@ class CLIChannel(Channel):
                     sessions = await self._session_mgr.list_sessions()
                     for s in sessions:
                         marker = " ←" if s.id == self._session_id else ""
-                        print(f"  {s.id[:8]}  {s.message_count}条消息{marker}")
+                        print(f"  {s.id[:8]}  标题：{s.title}{marker}")
                     continue
 
                 # 发送消息给 Agent
