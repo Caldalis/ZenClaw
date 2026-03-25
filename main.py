@@ -1,0 +1,178 @@
+"""
+主入口 — 启动器
+
+启动流程:
+  1. 加载配置 (YAML + 环境变量)
+  2. 初始化各模块 (记忆、会话、技能、提供商、Agent)
+  3. 启动 Gateway WebSocket 服务器（如果配置了 ws 通道）
+  4. 启动 CLI 通道（如果配置了 cli 通道）
+  5. 等待退出信号
+
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import signal
+import sys
+
+from miniclaw.agents.agent import Agent
+from miniclaw.agents.providers.registry import ProviderRegistry
+from miniclaw.channels.cli_channel import CLIChannel
+from miniclaw.config.loader import load_config
+from miniclaw.config.settings import Settings
+from miniclaw.gateway.server import GatewayServer
+from miniclaw.memory.sqlite_store import SQLiteMemoryStore
+from miniclaw.memory.vector_store import VectorMemoryStore
+from miniclaw.memory.embeddings import EmbeddingGenerator
+from miniclaw.sessions.manager import SessionManager
+from miniclaw.tools.loader import load_builtin_skills, load_skill_dirs
+from miniclaw.tools.registry import SkillRegistry
+from miniclaw.utils.logging import setup_logging, get_logger
+
+
+async def bootstrap(config: Settings) -> dict:
+    """初始化所有模块并返回核心组件
+
+    这是整个系统的组装过程（依赖注入 / Composition Root）。
+    对标 OpenClaw 的 bootstrap / createApp 过程。
+    """
+    logger = get_logger("bootstrap")
+    logger.info("正在初始化 MiniClaw v0.1.0...")
+
+    # 1. 记忆存储
+    if config.memory.enable_vector:
+        # 查找 OpenAI provider 的 API key 用于 embedding
+        api_key = ""
+        base_url = None
+        for p in config.providers:
+            if p.type == "openai" and p.api_key:
+                api_key = p.api_key
+                base_url = p.base_url
+                break
+        if api_key:
+            embedder = EmbeddingGenerator(
+                api_key=api_key,
+                model=config.memory.embedding_model,
+                base_url=base_url,
+            )
+            memory = VectorMemoryStore(config.memory.db_path, embedder, config.memory.embedding_dim)
+            logger.info("使用向量记忆存储")
+        else:
+            memory = SQLiteMemoryStore(config.memory.db_path)
+            logger.warning("向量存储已启用但缺少 OpenAI API Key，降级到 SQLite")
+    else:
+        memory = SQLiteMemoryStore(config.memory.db_path)
+
+    await memory.initialize()
+    logger.info("记忆存储已初始化")
+
+    # 2. 会话管理
+    session_mgr = SessionManager(memory, config.memory.db_path)
+    await session_mgr.initialize()
+    logger.info("会话管理器已初始化")
+
+    # 3. 技能系统
+    skill_registry = SkillRegistry()
+    load_builtin_skills(skill_registry)
+    if config.skill_dirs:
+        load_skill_dirs(skill_registry, config.skill_dirs)
+    logger.info("技能系统已初始化: %d 个技能", skill_registry.skill_count)
+
+    # 4. AI 提供商
+    provider_registry = ProviderRegistry(config.providers)
+    logger.info("AI 提供商已初始化: %d 个", provider_registry.provider_count)
+
+    # 5. Agent
+    agent = Agent(
+        config=config.agent,
+        provider_registry=provider_registry,
+        skill_registry=skill_registry,
+        session_manager=session_mgr,
+        memory_store=memory,
+    )
+    logger.info("Agent 已初始化")
+
+    return {
+        "memory": memory,
+        "session_mgr": session_mgr,
+        "skill_registry": skill_registry,
+        "provider_registry": provider_registry,
+        "agent": agent,
+    }
+
+
+async def run(config_path: str | None = None) -> None:
+    """主运行函数"""
+    # 加载配置
+    config = load_config(config_path)
+    setup_logging(config.debug)
+    logger = get_logger("main")
+
+    # 初始化
+    components = await bootstrap(config)
+    agent = components["agent"]
+    session_mgr = components["session_mgr"]
+    memory = components["memory"]
+
+    tasks = []
+
+    try:
+        # 启动 Gateway（如果有 ws 通道）
+        gateway = None
+        if "ws" in config.channels:
+            gateway = GatewayServer(config.gateway, agent, session_mgr)
+            await gateway.start()
+
+        # 启动 CLI 通道
+        if "cli" in config.channels:
+            cli = CLIChannel(agent, session_mgr)
+            await cli.start()  # 这会阻塞直到用户退出
+        else:
+            # 没有 CLI 通道时，保持运行直到收到信号
+            logger.info("MiniClaw 正在运行... (Ctrl+C 退出)")
+            stop_event = asyncio.Event()
+
+            def _signal_handler():
+                stop_event.set()
+
+            loop = asyncio.get_event_loop()
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                try:
+                    loop.add_signal_handler(sig, _signal_handler)
+                except NotImplementedError:
+                    # Windows 不支持 add_signal_handler
+                    pass
+
+            await stop_event.wait()
+
+    except KeyboardInterrupt:
+        logger.info("收到中断信号")
+    finally:
+        # 清理
+        logger.info("正在关闭...")
+        if gateway:
+            await gateway.stop()
+        await session_mgr.close()
+        await memory.close()
+        logger.info("MiniClaw 已关闭")
+
+
+def main():
+    """命令行入口"""
+    parser = argparse.ArgumentParser(description="MiniClaw — AI 助手平台")
+    parser.add_argument("-c", "--config", help="配置文件路径", default=None)
+    parser.add_argument("--debug", action="store_true", help="启用调试模式")
+    args = parser.parse_args()
+
+    # debug 模式通过环境变量传递
+    if args.debug:
+        import os
+        os.environ["MINICLAW_DEBUG"] = "1"
+
+    asyncio.run(run(args.config))
+
+
+if __name__ == "__main__":
+    main()

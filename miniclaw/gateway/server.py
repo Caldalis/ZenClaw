@@ -1,5 +1,5 @@
 """
-WebSocket 服务器 — 对标 OpenClaw 的 Gateway Server
+WebSocket 服务器
 
 Gateway 是 MiniClaw 的中央消息枢纽:
   - 接受 WebSocket 客户端连接
@@ -17,7 +17,7 @@ import json
 from typing import Any
 
 import websockets
-from websockets.server import WebSocketServerProtocol
+from websockets.asyncio.server import ServerConnection
 
 from miniclaw.agents.agent import Agent
 from miniclaw.config.settings import GatewayConfig
@@ -50,11 +50,11 @@ class GatewayServer:
         self._auth = TokenAuth(config.auth_token)
         self._router = MessageRouter(agent, session_manager, self._auth)
         self._server = None
-        self._connections: set[WebSocketServerProtocol] = set()
+        self._connections: set[ServerConnection] = set()
 
     async def start(self) -> None:
         """启动 WebSocket 服务器"""
-        self._server = await websockets.serve(
+        self._server = await websockets.asyncio.serve(
             self._handle_connection,
             self._config.host,
             self._config.port,
@@ -72,7 +72,7 @@ class GatewayServer:
             await self._server.wait_closed()
             logger.info("Gateway 已停止")
 
-    async def _handle_connection(self, websocket: WebSocketServerProtocol) -> None:
+    async def _handle_connection(self, websocket: ServerConnection) -> None:
         """处理单个客户端连接"""
         remote = websocket.remote_address
         logger.info("新连接: %s", remote)
