@@ -10,13 +10,13 @@ from pathlib import Path
 
 from miniclaw.utils.logging import get_logger
 
-from .base import Skill
-from .registry import SkillRegistry
+from .base import Tool
+from .registry import ToolRegistry
 
 logger = get_logger(__name__)
 
 
-def load_builtin_skills(registry: SkillRegistry) -> None:
+def load_builtin_tools(registry: ToolRegistry) -> None:
     """加载所有内置技能
 
     扫描 miniclaw.tools.builtin 包下的所有模块，
@@ -33,7 +33,7 @@ def load_builtin_skills(registry: SkillRegistry) -> None:
             logger.warning("加载内置技能 %s 失败: %s", module_name, e)
 
 
-def load_skill_dirs(registry: SkillRegistry, dirs: list[str]) -> None:
+def load_tool_dirs(registry: ToolRegistry, dirs: list[str]) -> None:
     """从用户指定的目录加载自定义技能
 
     Args:
@@ -62,14 +62,14 @@ def load_skill_dirs(registry: SkillRegistry, dirs: list[str]) -> None:
                 logger.warning("加载自定义技能 %s 失败: %s", py_file, e)
 
 
-def _register_skills_from_module(module, registry: SkillRegistry) -> None:
+def _register_skills_from_module(module, registry: ToolRegistry) -> None:
     """从模块中查找所有 Skill 子类并注册"""
     for attr_name in dir(module):
         attr = getattr(module, attr_name)
         if (
             isinstance(attr, type)
-            and issubclass(attr, Skill)
-            and attr is not Skill
+            and issubclass(attr, Tool)
+            and attr is not Tool
             and not getattr(attr, "__abstractmethods__", None)
         ):
             try:

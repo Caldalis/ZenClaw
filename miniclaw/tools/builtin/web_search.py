@@ -7,10 +7,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from miniclaw.tools.base import Skill
+from miniclaw.tools.base import Tool
 
 
-class WebSearchSkill(Skill):
+class WebSearchSkill(Tool):
     """网页搜索 — 使用 DuckDuckGo 搜索互联网"""
 
     @property

@@ -12,7 +12,7 @@ import math
 import operator
 from typing import Any
 
-from miniclaw.tools.base import Skill
+from miniclaw.tools.base import Tool
 
 
 # 允许的运算符和函数
@@ -35,7 +35,7 @@ _SAFE_FUNCTIONS = {
 }
 
 
-class CalculatorSkill(Skill):
+class CalculatorSkill(Tool):
     """安全计算器 — 执行数学表达式"""
 
     @property

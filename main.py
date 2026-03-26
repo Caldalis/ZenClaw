@@ -27,8 +27,10 @@ from miniclaw.memory.sqlite_store import SQLiteMemoryStore
 from miniclaw.memory.vector_store import VectorMemoryStore
 from miniclaw.memory.embeddings import EmbeddingGenerator
 from miniclaw.sessions.manager import SessionManager
-from miniclaw.tools.loader import load_builtin_skills, load_skill_dirs
-from miniclaw.tools.registry import SkillRegistry
+from miniclaw.tools.loader import load_builtin_tools, load_tool_dirs
+from miniclaw.tools.registry import ToolRegistry
+from miniclaw.tools.skill_md_loader import SkillManager
+from miniclaw.tools.builtin.load_skill_tool import LoadSkillTool, set_skill_manager
 from miniclaw.utils.logging import setup_logging, get_logger
 
 
@@ -73,12 +75,25 @@ async def bootstrap(config: Settings) -> dict:
     await session_mgr.initialize()
     logger.info("会话管理器已初始化")
 
-    # 3. 技能系统
-    skill_registry = SkillRegistry()
-    load_builtin_skills(skill_registry)
+    # 3a. SKILL.md 文件懒加载系统
+    skill_md_dirs = config.skill_dirs.copy() if config.skill_dirs else []
+    if not any("skills" in d for d in skill_md_dirs):
+        skill_md_dirs.append("skills")
+    skill_manager = SkillManager(skill_md_dirs)
+    set_skill_manager(skill_manager)
+    logger.info("SKILL.md 懒加载系统已初始化: %d 个技能", len(skill_manager.available_skills))
+
+    # 3b. 预注入: 将技能清单追加到系统提示词
+    preinject = skill_manager.get_preinject_content()
+    if preinject:
+        config.agent.system_prompt += preinject
+
+    # 3c. 技能系统（Python class based）
+    skill_registry = ToolRegistry()
+    load_builtin_tools(skill_registry)
     if config.skill_dirs:
-        load_skill_dirs(skill_registry, config.skill_dirs)
-    logger.info("技能系统已初始化: %d 个技能", skill_registry.skill_count)
+        load_tool_dirs(skill_registry, config.skill_dirs)
+    logger.info("技能系统已初始化: %d 个技能 (含 %d 个 SKILL.md)", skill_registry.skill_count, len(skill_manager.available_skills))
 
     # 4. AI 提供商
     provider_registry = ProviderRegistry(config.providers)
@@ -88,7 +103,7 @@ async def bootstrap(config: Settings) -> dict:
     agent = Agent(
         config=config.agent,
         provider_registry=provider_registry,
-        skill_registry=skill_registry,
+        tool_registry=skill_registry,
         session_manager=session_mgr,
         memory_store=memory,
     )

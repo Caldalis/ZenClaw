@@ -10,7 +10,7 @@ from abc import ABC, abstractmethod
 from typing import Any
 
 
-class Skill(ABC):
+class Tool(ABC):
     """
         技能抽象基类 — 所有技能必须继承此类
     """

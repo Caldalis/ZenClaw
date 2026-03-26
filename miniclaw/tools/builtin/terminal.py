@@ -9,10 +9,10 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from miniclaw.tools.base import Skill
+from miniclaw.tools.base import Tool
 
 
-class TerminalCommandSkill(Skill):
+class TerminalCommandSkill(Tool):
     """终端命令执行 — 执行系统命令并返回结果"""
 
     @property

@@ -8,19 +8,19 @@ from typing import Any
 
 from miniclaw.utils.logging import get_logger
 
-from .base import Skill
+from .base import Tool
 
 logger = get_logger(__name__)
 
 # 全局注册表实例
-_global_registry: SkillRegistry | None = None
+_global_registry: ToolRegistry | None = None
 
 
-class SkillRegistry:
+class ToolRegistry:
     """技能注册表 — 管理所有已注册的技能
 
     使用方式:
-      registry = SkillRegistry()
+      registry = ToolRegistry()
       registry.register(CalculatorSkill())
       registry.register(WeatherSkill())
 
@@ -30,9 +30,9 @@ class SkillRegistry:
     """
 
     def __init__(self):
-        self._skills: dict[str, Skill] = {}
+        self._skills: dict[str, Tool] = {}
 
-    def register(self, skill: Skill) -> None:
+    def register(self, skill: Tool) -> None:
         if skill.name in self._skills:
             logger.warning("技能 '%s' 已注册，将被覆盖", skill.name)
         self._skills[skill.name] = skill
@@ -42,11 +42,11 @@ class SkillRegistry:
         """取消注册一个技能"""
         self._skills.pop(name, None)
 
-    def get(self, name: str) -> Skill | None:
+    def get(self, name: str) -> Tool | None:
         """按名称获取技能"""
         return self._skills.get(name)
 
-    def list_skills(self) -> list[Skill]:
+    def list_skills(self) -> list[Tool]:
         """列出所有已注册的技能"""
         return list(self._skills.values())
 
@@ -69,23 +69,23 @@ class SkillRegistry:
         return name in self._skills
 
 
-def get_global_registry() -> SkillRegistry:
+def get_global_registry() -> ToolRegistry:
     """获取全局技能注册表（单例）"""
     global _global_registry
     if _global_registry is None:
-        _global_registry = SkillRegistry()
+        _global_registry = ToolRegistry()
     return _global_registry
 
 
 # 装饰器注册
 
 
-def skill_decorator(
+def tool_decorator(
     name: str,
     description: str,
     parameters: dict[str, Any],
 ):
-    """技能装饰器 — 将普通 async 函数包装为 Skill 并注册
+    """技能装饰器 — 将普通 async 函数包装为 Tool 并注册
 
     示例:
         @skill_decorator(
@@ -103,8 +103,8 @@ def skill_decorator(
     def decorator(func):
 
         skill_cls = type(
-            f"{name.title()}Skill",
-            (Skill,),
+            f"{name.title()}Tool",
+            (Tool,),
             {
                 "name": property(lambda self: name),
                 "description": property(lambda self: description),

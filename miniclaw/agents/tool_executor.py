@@ -13,7 +13,7 @@
 
 from __future__ import annotations
 
-from miniclaw.tools.registry import SkillRegistry
+from miniclaw.tools.registry import ToolRegistry
 from miniclaw.types.enums import Role
 from miniclaw.types.events import Event
 from miniclaw.types.messages import Message, ToolCall, ToolResult
@@ -25,8 +25,8 @@ logger = get_logger(__name__)
 class ToolExecutor:
     """工具调用执行器"""
 
-    def __init__(self, skill_registry: SkillRegistry):
-        self._registry = skill_registry
+    def __init__(self, tool_registry: ToolRegistry):
+        self._registry = tool_registry
 
     async def execute(
         self,

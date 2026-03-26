@@ -9,7 +9,7 @@ from typing import Any
 
 import httpx
 
-from miniclaw.tools.base import Skill
+from miniclaw.tools.base import Tool
 
 
 # Open-Meteo 地理编码 API
@@ -18,7 +18,7 @@ GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
 WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
 
 
-class WeatherSkill(Skill):
+class WeatherSkill(Tool):
     """天气查询 — 查询指定城市的当前天气"""
 
     @property

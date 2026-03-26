@@ -9,10 +9,10 @@ import os
 from pathlib import Path
 from typing import Any
 
-from miniclaw.tools.base import Skill
+from miniclaw.tools.base import Tool
 
 
-class FileWriterSkill(Skill):
+class FileWriterSkill(Tool):
     """文件写入 — 在当前目录下创建或修改文件"""
 
     @property

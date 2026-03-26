@@ -34,7 +34,7 @@ from miniclaw.config.settings import AgentConfig
 from miniclaw.memory.base import MemoryStore
 from miniclaw.sessions.history import ContextWindow
 from miniclaw.sessions.manager import SessionManager
-from miniclaw.tools.registry import SkillRegistry
+from miniclaw.tools.registry import ToolRegistry
 from miniclaw.types.enums import Role
 from miniclaw.types.events import Event
 from miniclaw.types.messages import Message
@@ -54,23 +54,23 @@ class Agent:
       ContextWindow  → 截取合适的上下文
       ProviderRegistry → 调用 AI
       ToolExecutor   → 执行工具
-      SkillRegistry  → 提供可用工具列表
+      ToolRegistry  → 提供可用工具列表
     """
 
     def __init__(
         self,
         config: AgentConfig,
         provider_registry: ProviderRegistry,
-        skill_registry: SkillRegistry,
+        tool_registry: ToolRegistry,
         session_manager: SessionManager,
         memory_store: MemoryStore,
     ):
         self._config = config
         self._providers = provider_registry
-        self._skills = skill_registry
+        self._skills = tool_registry
         self._session_mgr = session_manager
         self._memory = memory_store
-        self._tool_executor = ToolExecutor(skill_registry)
+        self._tool_executor = ToolExecutor(tool_registry)
         self._context_window = ContextWindow(config.max_context_tokens)
 
     async def process_message(self, user_message: Message, session_id: str) -> AsyncIterator[Event]:
