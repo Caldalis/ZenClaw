@@ -67,7 +67,7 @@ class Agent:
     ):
         self._config = config
         self._providers = provider_registry
-        self._skills = tool_registry
+        self._tools = tool_registry
         self._session_mgr = session_manager
         self._memory = memory_store
         self._tool_executor = ToolExecutor(tool_registry)
@@ -91,7 +91,7 @@ class Agent:
         yield Event.thinking(session_id)
 
         # Step 2: 获取工具 schema
-        tool_schemas = self._skills.get_tool_schemas() if self._skills.skill_count > 0 else None
+        tool_schemas = self._tools.get_tool_schemas() if self._tools.tool_count > 0 else None
 
         # Step 3: 工具调用循环
         iteration = 0
@@ -168,7 +168,7 @@ class Agent:
         await self._session_mgr.add_message(session_id, user_message)
         yield Event.thinking(session_id)
 
-        tool_schemas = self._skills.get_tool_schemas() if self._skills.skill_count > 0 else None
+        tool_schemas = self._tools.get_tool_schemas() if self._tools.tool_count > 0 else None
 
         iteration = 0
         while iteration < self._config.max_iterations:

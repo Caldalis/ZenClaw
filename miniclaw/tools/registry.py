@@ -46,7 +46,7 @@ class ToolRegistry:
         """按名称获取技能"""
         return self._skills.get(name)
 
-    def list_skills(self) -> list[Tool]:
+    def list_tools(self) -> list[Tool]:
         """列出所有已注册的技能"""
         return list(self._skills.values())
 
@@ -62,7 +62,7 @@ class ToolRegistry:
         return [skill.to_tool_schema() for skill in self._skills.values()]
 
     @property
-    def skill_count(self) -> int:
+    def tool_count(self) -> int:
         return len(self._skills)
 
     def __contains__(self, name: str) -> bool:

@@ -89,11 +89,11 @@ async def bootstrap(config: Settings) -> dict:
         config.agent.system_prompt += preinject
 
     # 3c. 技能系统（Python class based）
-    skill_registry = ToolRegistry()
-    load_builtin_tools(skill_registry)
-    if config.skill_dirs:
-        load_tool_dirs(skill_registry, config.skill_dirs)
-    logger.info("技能系统已初始化: %d 个技能 (含 %d 个 SKILL.md)", skill_registry.skill_count, len(skill_manager.available_skills))
+    tool_registry = ToolRegistry()
+    load_builtin_tools(tool_registry)
+    if config.tool_dirs:
+        load_tool_dirs(tool_registry, config.tool_dirs)
+    logger.info("技能系统已初始化: %d 个技能 (含 %d 个 SKILL.md)", tool_registry.tool_count, len(skill_manager.available_skills))
 
     # 4. AI 提供商
     provider_registry = ProviderRegistry(config.providers)
@@ -103,7 +103,7 @@ async def bootstrap(config: Settings) -> dict:
     agent = Agent(
         config=config.agent,
         provider_registry=provider_registry,
-        tool_registry=skill_registry,
+        tool_registry=tool_registry,
         session_manager=session_mgr,
         memory_store=memory,
     )
@@ -112,7 +112,7 @@ async def bootstrap(config: Settings) -> dict:
     return {
         "memory": memory,
         "session_mgr": session_mgr,
-        "skill_registry": skill_registry,
+        "tool_registry": tool_registry,
         "provider_registry": provider_registry,
         "agent": agent,
     }

@@ -56,5 +56,7 @@ class Settings(BaseModel):
     channels: list[str] = Field(default_factory=lambda: ["cli"])
     # 技能自动发现目录（额外的）
     skill_dirs: list[str] = Field(default_factory=list)
+    # 技能自动发现目录（额外的）
+    tool_dirs: list[str] = Field(default_factory=list)
     # 调试模式
     debug: bool = False
