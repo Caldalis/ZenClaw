@@ -28,8 +28,14 @@ class MemoryConfig(BaseModel):
     """记忆存储配置"""
     db_path: str = "data/miniclaw.db"       # SQLite 数据库路径
     enable_vector: bool = False              # 是否启用向量搜索
+    enable_fts: bool = True                  # 是否启用 FTS5 全文检索（BM25）
+    enable_hybrid: bool = False              # 是否启用混合检索（需要 enable_vector=True）
     embedding_model: str = "text-embedding-3-small"
     embedding_dim: int = 1536                # 嵌入向量维度
+    vector_weight: float = 0.7              # 混合检索中向量分数的权重
+    text_weight: float = 0.3               # 混合检索中 FTS5 分数的权重
+    memory_half_life_days: float = 30.0    # 记忆时间衰减半衰期（天）
+    tool_result_max_bytes: int = 102400    # 工具输出最大字节数（100KB）
 
 
 class AgentConfig(BaseModel):
@@ -37,6 +43,8 @@ class AgentConfig(BaseModel):
     system_prompt: str = "你是 MiniClaw，一个智能助手。你可以使用工具来帮助用户解决问题。"
     max_iterations: int = 10   # 工具调用循环最大轮数（防死循环）
     max_context_tokens: int = 8000  # 上下文窗口最大 token 数
+    compaction_threshold: float = 0.85  # 触发上下文压缩的 token 使用率阈值
+    compaction_keep_recent: int = 6     # 压缩时始终保留的最近消息条数
 
 
 class Settings(BaseModel):

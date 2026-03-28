@@ -95,3 +95,7 @@ class ContextWindow:
             sys_tokens, len(memory_messages), len(recent), self._max_tokens - remaining,
         )
         return context
+
+    def estimate_total_tokens(self, messages: list[Message]) -> int:
+        """估算消息列表的总 token 数（不含 system prompt）"""
+        return sum(m.token_estimate() for m in messages)

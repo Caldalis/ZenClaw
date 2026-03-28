@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+from miniclaw.memory.context_guard import ContextGuard
 from miniclaw.tools.registry import ToolRegistry
 from miniclaw.types.enums import Role
 from miniclaw.types.events import Event
@@ -25,8 +26,9 @@ logger = get_logger(__name__)
 class ToolExecutor:
     """工具调用执行器"""
 
-    def __init__(self, tool_registry: ToolRegistry):
+    def __init__(self, tool_registry: ToolRegistry, tool_result_max_bytes: int = 102400):
         self._registry = tool_registry
+        self._max_bytes = tool_result_max_bytes
 
     async def execute(
         self,
@@ -68,6 +70,10 @@ class ToolExecutor:
                     result_text = f"工具执行错误: {e}"
                     is_error = True
                     logger.error("工具 %s 执行失败: %s", tc.name, e, exc_info=True)
+
+            # 工具输出截断（仅截断成功结果，错误信息通常较短）
+            if not is_error:
+                result_text = ContextGuard.truncate_tool_result(result_text, self._max_bytes)
 
             # 构建工具结果消息
             tool_result = ToolResult(

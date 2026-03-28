@@ -1,5 +1,6 @@
 """
 记忆存储抽象基类
+抽象基类定义统一接口，具体实现可以是 SQLite、PostgreSQL 或其他存储。
 """
 
 from __future__ import annotations
@@ -44,6 +45,11 @@ class MemoryStore(ABC):
 
         默认实现返回空列表。启用向量搜索后可返回语义相关的历史消息。
         """
+        ...
+
+    @abstractmethod
+    async def delete_message(self, message_id: str) -> None:
+        """删除单条消息（用于上下文压缩）"""
         ...
 
     @abstractmethod

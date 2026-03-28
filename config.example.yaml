@@ -24,15 +24,23 @@ gateway:
 # 记忆存储
 memory:
   db_path: "data/miniclaw.db"
-  enable_vector: false     # 启用向量搜索（需要 numpy + OpenAI Embeddings API）
+  enable_vector: false     # 启用向量语义搜索（需要 numpy + OpenAI Embeddings API）
+  enable_fts: true         # 启用 FTS5 全文检索 BM25（无需额外依赖）
+  enable_hybrid: false     # 启用混合检索（需要 enable_vector: true）
   embedding_model: "text-embedding-3-small"
   embedding_dim: 1536
+  vector_weight: 0.7       # 混合检索中向量分数权重
+  text_weight: 0.3         # 混合检索中 FTS5 分数权重
+  memory_half_life_days: 30.0  # 记忆时间衰减半衰期（天）
+  tool_result_max_bytes: 102400  # 工具输出最大字节数（100KB 硬上限）
 
 # Agent 配置
 agent:
   system_prompt: "你是 MiniClaw，一个智能助手。你可以使用工具来帮助用户解决问题。请用中文回答。"
   max_iterations: 10       # 工具调用循环最大轮数
   max_context_tokens: 8000 # 上下文窗口 token 上限
+  compaction_threshold: 0.85  # 触发上下文压缩的 token 使用率（0.85 = 85%）
+  compaction_keep_recent: 6   # 压缩时始终保留的最近消息条数
 
 # 启用的通道
 channels:

@@ -21,6 +21,7 @@ Agent 是整个系统的核心，实现了 AI 对话 + 工具调用循环:
   - 事件驱动: 不返回字符串，产出 Event 流
   - 工具调用循环: 多轮调用直到 AI 不再请求工具
   - max_iterations: 防止死循环（AI 可能无限循环调用工具）
+  - ContextGuard: Token 记账 + 自动压缩 + 工具输出截断
 """
 
 from __future__ import annotations
@@ -30,8 +31,9 @@ from typing import AsyncIterator
 from miniclaw.agents.providers.registry import ProviderRegistry
 from miniclaw.agents.streaming import process_stream
 from miniclaw.agents.tool_executor import ToolExecutor
-from miniclaw.config.settings import AgentConfig
+from miniclaw.config.settings import AgentConfig, MemoryConfig
 from miniclaw.memory.base import MemoryStore
+from miniclaw.memory.context_guard import ContextGuard, COMPACTION_PROMPT_TEMPLATE
 from miniclaw.sessions.history import ContextWindow
 from miniclaw.sessions.manager import SessionManager
 from miniclaw.tools.registry import ToolRegistry
@@ -52,6 +54,7 @@ class Agent:
     协作关系:
       SessionManager → 提供对话历史
       ContextWindow  → 截取合适的上下文
+      ContextGuard   → Token 记账 + 压缩触发 + 工具输出截断
       ProviderRegistry → 调用 AI
       ToolExecutor   → 执行工具
       ToolRegistry  → 提供可用工具列表
@@ -64,14 +67,22 @@ class Agent:
         tool_registry: ToolRegistry,
         session_manager: SessionManager,
         memory_store: MemoryStore,
+        memory_config: MemoryConfig | None = None,
     ):
         self._config = config
         self._providers = provider_registry
         self._tools = tool_registry
         self._session_mgr = session_manager
         self._memory = memory_store
-        self._tool_executor = ToolExecutor(tool_registry)
+
+        mem_cfg = memory_config or MemoryConfig()
+        self._tool_executor = ToolExecutor(tool_registry, tool_result_max_bytes=mem_cfg.tool_result_max_bytes)
         self._context_window = ContextWindow(config.max_context_tokens)
+        self._context_guard = ContextGuard(
+            max_context_tokens=config.max_context_tokens,
+            compaction_threshold=config.compaction_threshold,
+        )
+        self._compaction_keep_recent = config.compaction_keep_recent
 
     async def process_message(self, user_message: Message, session_id: str) -> AsyncIterator[Event]:
         """处理用户消息 — Agent 的核心入口
@@ -84,6 +95,7 @@ class Agent:
           2. 构建上下文
           3. 调用 AI（可能多轮工具调用循环）
           4. 保存 AI 回复
+          5. 检查是否需要上下文压缩
           5. 产出事件流
         """
         # Step 1: 保存用户消息
@@ -130,6 +142,12 @@ class Agent:
 
             # 保存 AI 回复
             await self._session_mgr.add_message(session_id, ai_message)
+
+            # 检查是否需要上下文压缩
+            session = await self._session_mgr.get_session(session_id)
+            if session and self._context_guard.should_compact(session.messages):
+                logger.info("上下文接近上限 (%d messages)，开始自动压缩...", len(session.messages))
+                await self._compact_messages(session_id, session.messages)
 
             # 检查是否有工具调用
             if ai_message.is_tool_call():
@@ -214,6 +232,12 @@ class Agent:
 
             await self._session_mgr.add_message(session_id, ai_message)
 
+            # 检查是否需要上下文压缩
+            session = await self._session_mgr.get_session(session_id)
+            if session and self._context_guard.should_compact(session.messages):
+                logger.info("上下文接近上限，开始自动压缩...")
+                await self._compact_messages(session_id, session.messages)
+
             if ai_message.is_tool_call():
                 tool_messages, tool_events = await self._tool_executor.execute(
                     ai_message.tool_calls, session_id
@@ -229,6 +253,77 @@ class Agent:
 
         yield Event.error(f"处理轮数超过上限 ({self._config.max_iterations})", session_id)
         yield Event.done(session_id)
+
+    async def _compact_messages(self, session_id: str, messages: list[Message]) -> None:
+        """将旧消息压缩为摘要，节省上下文 token
+
+        流程:
+          1. 分割消息为「待压缩」和「保留」
+          2. 构建摘要 prompt，调用 LLM 生成摘要
+          3. 将待压缩消息替换为一条摘要消息
+          4. 持久化变更（删除旧消息，保存摘要）
+        """
+        to_compact, to_keep = self._context_guard.select_messages_for_compaction(
+            messages,
+            keep_recent=self._compaction_keep_recent,
+        )
+        if not to_compact:
+            logger.debug("压缩: 没有可压缩的消息")
+            return
+
+        # 构建对话文本用于摘要
+        lines = []
+        for msg in to_compact:
+            role_label = msg.role.value
+            content = msg.content or ""
+            if msg.tool_calls:
+                content += f" [调用工具: {[tc.name for tc in msg.tool_calls]}]"
+            if msg.tool_result:
+                content += f" [工具结果: {msg.tool_result.content[:200]}...]"
+            lines.append(f"[{role_label}]: {content}")
+        conversation_text = "\n".join(lines)
+
+        summary_prompt = COMPACTION_PROMPT_TEMPLATE.format(conversation_text=conversation_text)
+        summary_request = [
+            Message(role=Role.SYSTEM, content="你是一个对话摘要助手，擅长将长对话压缩为简洁摘要。"),
+            Message(role=Role.USER, content=summary_prompt),
+        ]
+
+        try:
+            summary_msg = await self._call_ai_with_failover(summary_request, tools=None)
+        except Exception as e:
+            logger.warning("压缩摘要生成失败: %s，跳过本次压缩", e)
+            return
+
+        summary_message = Message(
+            role=Role.SYSTEM,
+            content=f"[对话历史摘要]\n{summary_msg.content}",
+            session_id=session_id,
+        )
+
+        # 更新内存中的会话（session 是缓存对象的引用）
+        session = await self._session_mgr.get_session(session_id)
+        if session is None:
+            return
+
+        ids_to_delete = {m.id for m in to_compact}
+        system_msgs = [m for m in to_keep if m.role == Role.SYSTEM]
+        non_system_keep = [m for m in to_keep if m.role != Role.SYSTEM]
+        session.messages = system_msgs + [summary_message] + non_system_keep
+
+        # 持久化：删除旧消息，保存摘要
+        for msg_id in ids_to_delete:
+            try:
+                await self._memory.delete_message(msg_id)
+            except Exception as e:
+                logger.warning("删除消息 %s 失败: %s", msg_id[:8], e)
+        await self._memory.save_message(session_id, summary_message)
+
+        logger.info(
+            "压缩完成: 压缩 %d 条 → 1 条摘要，保留 %d 条",
+            len(to_compact),
+            len(non_system_keep),
+        )
 
     async def _call_ai_with_failover(
         self,

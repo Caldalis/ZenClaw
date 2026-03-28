@@ -23,9 +23,10 @@ from miniclaw.channels.cli_channel import CLIChannel
 from miniclaw.config.loader import load_config
 from miniclaw.config.settings import Settings
 from miniclaw.gateway.server import GatewayServer
+from miniclaw.memory.embeddings import EmbeddingGenerator
+from miniclaw.memory.hybrid_store import HybridMemoryStore
 from miniclaw.memory.sqlite_store import SQLiteMemoryStore
 from miniclaw.memory.vector_store import VectorMemoryStore
-from miniclaw.memory.embeddings import EmbeddingGenerator
 from miniclaw.sessions.manager import SessionManager
 from miniclaw.tools.loader import load_builtin_tools, load_tool_dirs
 from miniclaw.tools.registry import ToolRegistry
@@ -44,28 +45,44 @@ async def bootstrap(config: Settings) -> dict:
     logger.info("正在初始化 MiniClaw v0.1.0...")
 
     # 1. 记忆存储
-    if config.memory.enable_vector:
-        # 查找 OpenAI provider 的 API key 用于 embedding
-        api_key = ""
-        base_url = None
+    mem_cfg = config.memory
+
+    def _make_embedder() -> EmbeddingGenerator | None:
         for p in config.providers:
             if p.type == "openai" and p.api_key:
-                api_key = p.api_key
-                base_url = p.base_url
-                break
-        if api_key:
-            embedder = EmbeddingGenerator(
-                api_key=api_key,
-                model=config.memory.embedding_model,
-                base_url=base_url,
+                return EmbeddingGenerator(
+                    api_key=p.api_key,
+                    model=mem_cfg.embedding_model,
+                    base_url=p.base_url,
+                )
+        return None
+
+    if mem_cfg.enable_hybrid and mem_cfg.enable_vector:
+        embedder = _make_embedder()
+        if embedder:
+            memory = HybridMemoryStore(
+                db_path=mem_cfg.db_path,
+                embedding_generator=embedder,
+                embedding_dim=mem_cfg.embedding_dim,
+                vector_weight=mem_cfg.vector_weight,
+                text_weight=mem_cfg.text_weight,
+                memory_half_life_days=mem_cfg.memory_half_life_days,
             )
-            memory = VectorMemoryStore(config.memory.db_path, embedder, config.memory.embedding_dim)
+            logger.info("使用混合记忆存储 (FTS5 + 向量 + MMR + 时间衰减)")
+        else:
+            memory = SQLiteMemoryStore(mem_cfg.db_path, enable_fts=mem_cfg.enable_fts)
+            logger.warning("混合存储需要 OpenAI API Key，降级到 SQLite+FTS")
+    elif mem_cfg.enable_vector:
+        embedder = _make_embedder()
+        if embedder:
+            memory = VectorMemoryStore(mem_cfg.db_path, embedder, mem_cfg.embedding_dim)
             logger.info("使用向量记忆存储")
         else:
-            memory = SQLiteMemoryStore(config.memory.db_path)
-            logger.warning("向量存储已启用但缺少 OpenAI API Key，降级到 SQLite")
+            memory = SQLiteMemoryStore(mem_cfg.db_path, enable_fts=mem_cfg.enable_fts)
+            logger.warning("向量存储已启用但缺少 OpenAI API Key，降级到 SQLite+FTS")
     else:
-        memory = SQLiteMemoryStore(config.memory.db_path)
+        memory = SQLiteMemoryStore(mem_cfg.db_path, enable_fts=mem_cfg.enable_fts)
+        logger.info("使用 SQLite 记忆存储 (FTS5=%s)", mem_cfg.enable_fts)
 
     await memory.initialize()
     logger.info("记忆存储已初始化")
@@ -102,6 +119,7 @@ async def bootstrap(config: Settings) -> dict:
     # 5. Agent
     agent = Agent(
         config=config.agent,
+        memory_config=config.memory,
         provider_registry=provider_registry,
         tool_registry=tool_registry,
         session_manager=session_mgr,
