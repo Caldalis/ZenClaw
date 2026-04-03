@@ -73,7 +73,9 @@ class SQLiteMemoryStore(MemoryStore):
             """)
 
         await self._db.commit()
-        logger.info("SQLite 记忆存储已初始化: %s (FTS5=%s)", self._db_path, self._enable_fts)
+        logger.info(
+            "SQLite 记忆存储已初始化: %s (FTS5=%s)", self._db_path, self._enable_fts
+        )
 
     def _row_to_message(self, row: tuple, session_id: str) -> Message:
         """将数据库行解析为 Message 对象"""
@@ -94,10 +96,14 @@ class SQLiteMemoryStore(MemoryStore):
         assert self._db is not None
         tool_calls_json = None
         if message.tool_calls:
-            tool_calls_json = json.dumps([tc.model_dump() for tc in message.tool_calls], ensure_ascii=False)
+            tool_calls_json = json.dumps(
+                [tc.model_dump() for tc in message.tool_calls], ensure_ascii=False
+            )
         tool_result_json = None
         if message.tool_result:
-            tool_result_json = json.dumps(message.tool_result.model_dump(), ensure_ascii=False)
+            tool_result_json = json.dumps(
+                message.tool_result.model_dump(), ensure_ascii=False
+            )
 
         await self._db.execute(
             """INSERT OR REPLACE INTO messages
@@ -136,13 +142,17 @@ class SQLiteMemoryStore(MemoryStore):
         rows = await cursor.fetchall()
         return [self._row_to_message(row, session_id) for row in reversed(rows)]
 
-    async def search(self, session_id: str, query: str, top_k: int = 5) -> list[Message]:
+    async def search(
+        self, session_id: str, query: str, top_k: int = 5
+    ) -> list[Message]:
         """搜索相关消息：FTS5 BM25 检索或降级到 LIKE 搜索"""
         if self._enable_fts:
             return await self._fts_search(session_id, query, top_k)
         return await self._like_search(session_id, query, top_k)
 
-    async def _fts_search(self, session_id: str, query: str, top_k: int) -> list[Message]:
+    async def _fts_search(
+        self, session_id: str, query: str, top_k: int
+    ) -> list[Message]:
         """FTS5 BM25 全文检索"""
         assert self._db is not None
         safe_query = _sanitize_fts_query(query)
@@ -163,7 +173,9 @@ class SQLiteMemoryStore(MemoryStore):
             logger.warning("FTS5 搜索失败: %s，降级到 LIKE 搜索", e)
             return await self._like_search(session_id, query, top_k)
 
-    async def _like_search(self, session_id: str, query: str, top_k: int) -> list[Message]:
+    async def _like_search(
+        self, session_id: str, query: str, top_k: int
+    ) -> list[Message]:
         """LIKE 全文匹配（兜底方案）"""
         assert self._db is not None
         cursor = await self._db.execute(
@@ -190,8 +202,12 @@ class SQLiteMemoryStore(MemoryStore):
     async def delete_session(self, session_id: str) -> None:
         assert self._db is not None
         if self._enable_fts:
-            await self._db.execute("DELETE FROM chunks_fts WHERE session_id = ?", (session_id,))
-        await self._db.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+            await self._db.execute(
+                "DELETE FROM chunks_fts WHERE session_id = ?", (session_id,)
+            )
+        await self._db.execute(
+            "DELETE FROM messages WHERE session_id = ?", (session_id,)
+        )
         await self._db.commit()
 
     async def close(self) -> None:
