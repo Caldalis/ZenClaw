@@ -4,7 +4,14 @@
 
 from __future__ import annotations
 
+from enum import Enum
 from pydantic import BaseModel, Field
+
+
+class ExecutionMode(str, Enum):
+    """执行模式"""
+    SINGLE_AGENT = "single_agent"        # 单 Agent ReAct 循环
+    MASTER_SUBAGENT = "master_subagent"  # Master-Subagent 多智能体架构
 
 
 class ProviderConfig(BaseModel):
@@ -47,12 +54,43 @@ class AgentConfig(BaseModel):
     compaction_keep_recent: int = 6     # 压缩时始终保留的最近消息条数
 
 
+class SubagentConfig(BaseModel):
+    """Subagent 架构配置 — 仅在 MASTER_SUBAGENT 模式下生效"""
+    # 护栏配置
+    max_spawn_depth: int = 5              # 最大衍生深度
+    max_children_per_agent: int = 3       # 单节点最大子节点数
+    max_total_agents: int = 50            # DAG 最大节点数
+
+    # 执行配置
+    default_max_steps: int = 15           # 默认最大 ReAct 步数
+    default_timeout_ms: int = 120000      # 默认超时时间（毫秒）
+    max_concurrent_tasks: int = 3         # 最大并发任务数
+
+    # Worktree 配置
+    enable_worktree: bool = True          # 是否启用 Git Worktree 隔离
+    worktree_base_dir: str = ".agents/worktrees"  # worktree 存放目录
+    auto_merge: bool = True               # 任务成功后自动合并
+    auto_cleanup: bool = True             # 自动清理 worktree
+
+    # Critic 配置
+    enable_critic: bool = True            # 是否启用 Critic 警示
+    enable_circuit_breaker: bool = True   # 是否启用熔断器
+    circuit_breaker_threshold: int = 3    # 熔断阈值
+
+    # 验证配置
+    require_validation: bool = True       # 是否强制验证闭环
+    validation_requirement: str = "any"   # any | linter | tests | both
+
+
 class Settings(BaseModel):
     """MiniClaw 全局配置 — 所有模块的配置汇总
 
     对标 OpenClaw 的 AppConfig，是整个系统的配置中心。
     通过 config/loader.py 加载 YAML 文件并合并环境变量。
     """
+    # 执行模式
+    execution_mode: ExecutionMode = ExecutionMode.SINGLE_AGENT
+
     # AI 提供商列表 — 按优先级排序，支持故障转移
     providers: list[ProviderConfig] = Field(
         default_factory=lambda: [ProviderConfig()]
@@ -60,11 +98,17 @@ class Settings(BaseModel):
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     agent: AgentConfig = Field(default_factory=AgentConfig)
+    subagent: SubagentConfig = Field(default_factory=SubagentConfig)
+
     # 启用的通道
     channels: list[str] = Field(default_factory=lambda: ["cli"])
     # 技能自动发现目录（额外的）
     skill_dirs: list[str] = Field(default_factory=list)
-    # 技能自动发现目录（额外的）
+    # 工具自动发现目录（额外的）
     tool_dirs: list[str] = Field(default_factory=list)
     # 调试模式
     debug: bool = False
+
+    def is_master_subagent_mode(self) -> bool:
+        """是否为 Master-Subagent 模式"""
+        return self.execution_mode == ExecutionMode.MASTER_SUBAGENT

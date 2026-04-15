@@ -48,3 +48,24 @@ class SessionStatus(str, Enum):
     """会话状态"""
     ACTIVE = "active"
     ARCHIVED = "archived"
+
+
+class TurnStatus(str, Enum):
+    """Turn 执行状态 — 用于多 Agent 架构的状态追踪"""
+    PENDING = "pending"        # 等待执行
+    RUNNING = "running"        # 正在执行
+    COMPLETED = "completed"    # 成功完成
+    FAILED = "failed"          # 执行失败
+    TIMEOUT = "timeout"        # 超时终止
+    INTERRUPTED = "interrupted"  # 被中断（如进程崩溃）
+
+
+class AgentRole(str, Enum):
+    """Agent 角色类型 — 用于 Subagent 角色分化"""
+    MASTER = "master"          # 主 Agent（调度器）
+    CODER = "coder"            # 编码执行者
+    SEARCHER = "searcher"      # 搜索/研究执行者
+    REVIEWER = "reviewer"      # 代码审查执行者
+    TESTER = "tester"          # 测试执行者
+    PLANNER = "planner"        # 规划执行者
+    GENERIC = "generic"        # 通用执行者
