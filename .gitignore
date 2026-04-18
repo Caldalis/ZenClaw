@@ -28,6 +28,7 @@ MANIFEST
 
 data/
 tests/
+test1/
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
