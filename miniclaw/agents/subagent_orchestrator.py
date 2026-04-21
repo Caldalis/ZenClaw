@@ -286,11 +286,54 @@ class SubagentOrchestrator:
         master_node: AgentNode,
         session_id: str,
     ) -> TaskGraphResult:
-        """执行任务图"""
+        """执行任务图（内部方法，由 process_message 调用）"""
+        return await self.execute_task_graph(request, master_node)
+
+    async def execute_task_graph(
+        self,
+        request: TaskGraphRequest,
+        master_node: AgentNode,
+        timeout_seconds: int = 300,
+    ) -> TaskGraphResult:
+        """执行任务图（外部入口，由 MasterAgent._wait_for_graph_result 调用）
+
+        Args:
+            request: 任务图请求
+            master_node: Master Agent 节点
+            timeout_seconds: 总超时时间
+
+        Returns:
+            TaskGraphResult: 执行结果
+        """
         if self._scheduler is None:
             raise RuntimeError("TaskScheduler 未初始化")
 
-        return await self._scheduler.schedule(request, master_node)
+        # 将 Orchestrator 自身注入到 scheduler，使 _execute_single_task 能调用真实 Agent
+        self._scheduler.set_orchestrator(self)
+
+        # 执行调度
+        try:
+            result = await asyncio.wait_for(
+                self._scheduler.schedule(request, master_node),
+                timeout=timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("任务图执行超时: %ds", timeout_seconds)
+            # 从 scheduler 获取当前结果
+            ctx = self._scheduler._running_graphs.get(request.graph_id if hasattr(request, 'graph_id') else "")
+            if ctx:
+                ctx.result.status = "timeout"
+                return ctx.result
+            return TaskGraphResult(
+                graph_id="timeout",
+                total_tasks=len(request.tasks),
+                max_depth=0,
+                execution_order=[],
+                dynamic_roles=[],
+                status="timeout",
+            )
+
+        return result
 
     def _format_graph_result(self, result: TaskGraphResult) -> str:
         """格式化任务图结果"""
@@ -334,10 +377,14 @@ class SubagentOrchestrator:
         if self._subagent_executor is None:
             raise RuntimeError("SubagentExecutor 未初始化")
 
-        # 检查护栏
+        # 检查护栏 — caller_depth 从 DAG 推断
+        # 每个 spawn 的 subagent 深度 = master(0) + 任务依赖层数
+        task_depth = 1  # 基础深度：从 master spawn 第一层
+        # 如果任务有依赖，深度可能更高（间接依赖链长度）
+        # 但护栏检查只关心直接 spawn 深度
         self._registry.guardrails.check_can_spawn(
-            caller_depth=0,  # TODO: 获取正确的深度
-            caller_children_count=0,
+            caller_depth=task_depth - 1,  # 父节点深度 = 当前深度 - 1
+            caller_children_count=self._state.active_subagents,
             caller_id="master",
             total_agent_count=self._state.active_subagents,
         )

@@ -134,7 +134,10 @@ class MasterAgent:
         graph_id: str,
         timeout_seconds: int = 300,
     ) -> TaskGraphResult | None:
-        """等待任务图执行完成"""
+        """等待任务图执行完成
+
+        通过 Orchestrator 调度执行子任务图，并等待结果返回。
+        """
         from miniclaw.tools.builtin.create_task_graph import get_pending_graph
 
         # 获取任务图请求
@@ -143,17 +146,46 @@ class MasterAgent:
             logger.warning("任务图请求不存在: %s", graph_id)
             return None
 
-        # 使用 orchestrator 的 scheduler 执行
-        # 这里简化处理，实际应该更复杂
-        # TODO: 完善任务图执行逻辑
+        # 通过 Orchestrator 执行任务图
+        # 创建 Master Agent 节点用于 DAG 构建
+        from miniclaw.types.enums import AgentRole
+        from miniclaw.types.turn_snapshot import AgentNode
 
-        return TaskGraphResult(
-            graph_id=graph_id,
-            total_tasks=len(request.tasks),
-            max_depth=0,
-            execution_order=[],
-            dynamic_roles=[],
+        master_node = AgentNode(
+            agent_id="master-001",
+            role=AgentRole.MASTER,
+            depth=0,
+            session_id="master-session",
         )
+
+        try:
+            # 委托给 Orchestrator 的调度器执行
+            graph_result = await self._orchestrator.execute_task_graph(
+                request, master_node, timeout_seconds=timeout_seconds,
+            )
+
+            logger.info(
+                "任务图 %s 执行完成: status=%s, completed=%d, failed=%d",
+                graph_id,
+                graph_result.status if graph_result else "unknown",
+                len(graph_result.completed_tasks) if graph_result else 0,
+                len(graph_result.failed_tasks) if graph_result else 0,
+            )
+
+            return graph_result
+
+        except Exception as e:
+            logger.error("任务图执行失败: %s", e)
+            # 返回一个失败结果
+            return TaskGraphResult(
+                graph_id=graph_id,
+                total_tasks=len(request.tasks),
+                max_depth=0,
+                execution_order=[],
+                dynamic_roles=[],
+                status="failed",
+                failed_tasks=[t.id for t in request.tasks],
+            )
 
     def _build_result_message(self, result: TaskGraphResult) -> Message:
         """构建结果消息"""

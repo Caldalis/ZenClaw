@@ -19,7 +19,6 @@ from typing import Any
 import websockets
 from websockets.asyncio.server import ServerConnection, serve
 
-from miniclaw.agents.agent import Agent
 from miniclaw.config.settings import GatewayConfig
 from miniclaw.sessions.manager import SessionManager
 from miniclaw.utils.logging import get_logger
@@ -43,7 +42,7 @@ class GatewayServer:
     def __init__(
         self,
         config: GatewayConfig,
-        agent: Agent,
+        agent: Any,
         session_manager: SessionManager,
     ):
         self._config = config

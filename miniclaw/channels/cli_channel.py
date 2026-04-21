@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 import sys
 
-from miniclaw.agents.agent import Agent
+from typing import Any
 from miniclaw.sessions.manager import SessionManager
 from miniclaw.types.enums import EventType, Role
 from miniclaw.types.messages import Message
@@ -33,7 +33,7 @@ logger = get_logger(__name__)
 class CLIChannel(Channel):
     """CLI 终端通道"""
 
-    def __init__(self, agent: Agent, session_manager: SessionManager):
+    def __init__(self, agent: Any, session_manager: SessionManager):
         self._agent = agent
         self._session_mgr = session_manager
         self._running = False
@@ -74,13 +74,13 @@ class CLIChannel(Channel):
         # 欢迎消息
         if use_rich:
             console.print(Panel.fit(
-                "[bold cyan]MiniClaw[/bold cyan] — AI 助手\n"
+                "[bold cyan]ZenClaw[/bold cyan] — AI 助手\n"
                 "输入消息开始对话，输入 [bold]/quit[/bold] 退出，[bold]/new[/bold] 新建会话",
                 border_style="cyan",
             ))
         else:
             print("=" * 50)
-            print("MiniClaw — AI 助手")
+            print("ZenClaw — AI 助手")
             print("输入消息开始对话，输入 /quit 退出，/new 新建会话")
             print("=" * 50)
 
@@ -89,10 +89,10 @@ class CLIChannel(Channel):
             try:
                 # 读取用户输入
                 if use_rich:
-                    user_input = console.input("[bold green]你> [/bold green]")
+                    user_input = console.input("[bold green]> [/bold green]")
                 else:
                     user_input = await asyncio.get_event_loop().run_in_executor(
-                        None, lambda: input("你> ")
+                        None, lambda: input("> ")
                     )
 
                 user_input = user_input.strip()

@@ -69,6 +69,18 @@ class TaskScheduler:
         # 子任务结果回调
         self._result_callbacks: dict[str, Callable] = {}
 
+        # Orchestrator 引用（用于真实 Agent 执行）
+        self._orchestrator: Any = None
+
+    def set_orchestrator(self, orchestrator: Any) -> None:
+        """设置 Orchestrator 引用，用于 _execute_single_task 调用真实 Agent
+
+        Args:
+            orchestrator: SubagentOrchestrator 实例
+        """
+        self._orchestrator = orchestrator
+        logger.info("TaskScheduler 已绑定 Orchestrator")
+
     async def schedule(
         self,
         request: TaskGraphRequest,
@@ -187,11 +199,21 @@ class TaskScheduler:
         # 并行执行
         results = await asyncio.gather(*async_tasks, return_exceptions=True)
 
+        # 获取 DAG 用于状态更新
+        dag = self._get_or_create_dag(ctx)
+
         # 处理结果
         for task_id, result in zip(task_ids, results):
+            agent_id = ctx.task_to_agent.get(task_id)
+
             if isinstance(result, Exception):
                 ctx.result.failed_tasks.append(task_id)
                 ctx.failed_tasks.add(task_id)
+
+                # 更新 Dispatcher DAG 状态
+                if agent_id and dag:
+                    await self._dispatcher.fail_agent(dag, agent_id, str(result))
+
                 if ctx.request.fail_fast:
                     raise DispatcherError(
                         f"任务 {task_id} 失败: {result}",
@@ -201,6 +223,10 @@ class TaskScheduler:
                 ctx.result.completed_tasks.append(task_id)
                 ctx.completed_tasks.add(task_id)
 
+                # 更新 Dispatcher DAG 状态
+                if agent_id and dag:
+                    await self._dispatcher.complete_agent(dag, agent_id)
+
     async def _execute_single_task(
         self,
         ctx: GraphExecutionContext,
@@ -209,10 +235,11 @@ class TaskScheduler:
         """执行单个任务
 
         流程:
-          1. 创建 Subagent Node
-          2. 创建 Turn Snapshot
-          3. 调用 Dispatcher 执行
-          4. 收集结果
+          1. 创建 Subagent 配置
+          2. 通过 Orchestrator 准备执行环境
+          3. 使用真实 Agent 执行任务（ReAct 循环）
+          4. 收集结构化结果
+          5. 失败时触发 Critic 系统
         """
         # 解析角色
         role = self._parse_role(task.role)
@@ -237,15 +264,181 @@ class TaskScheduler:
             task.id, subagent_node.agent_id, task.role
         )
 
-        # 这里需要实际的 Agent 执行器
-        # 目前返回模拟结果，后续集成真正的 Agent.process_message TODO
-        result = await self._simulate_execution(snapshot, task)
+        # 使用 Orchestrator 执行真实 Agent（如果可用）
+        if self._orchestrator is not None:
+            result = await self._execute_with_agent(ctx, task, snapshot)
+        else:
+            # 回退到模拟执行（用于测试场景）
+            result = await self._simulate_execution(snapshot, task)
 
         # 记录结果到任务节点
         task.result = result
-        task.is_error = result.startswith("错误:")
+        task.is_error = result.startswith("错误:") or result.startswith("失败:")
+
+        # 保存到上下文
+        ctx.task_results[task.id] = result
+        ctx.task_to_agent[task.id] = subagent_node.agent_id
 
         return result
+
+    async def _execute_with_agent(
+        self,
+        ctx: GraphExecutionContext,
+        task: TaskNode,
+        snapshot: TurnSnapshot,
+    ) -> str:
+        """通过 Orchestrator 执行真实 Agent
+
+        使用 SubagentExecutor 运行 Agent 的 ReAct 循环：
+          1. 准备执行环境（Worktree + 隔离工具）
+          2. 构建隔离上下文
+          3. 调用 Agent.process_message 执行
+          4. 收集结果并验证
+          5. 失败时检查 Circuit Breaker
+        """
+        from miniclaw.agents.context_isolator import ContextIsolator
+        from miniclaw.types.structured_result import validate_result
+        from miniclaw.types.messages import Message
+        from miniclaw.types.enums import Role as MsgRole
+
+        orchestrator = self._orchestrator
+
+        # 1. 创建 Subagent 配置
+        subagent_config = orchestrator._factory.create_config(
+            task=task,
+            parent_agent_id=ctx.master_node.agent_id,
+            session_id=snapshot.node.session_id,
+        )
+
+        # 2. 准备执行环境
+        exec_ctx = await orchestrator._subagent_executor.prepare_for_execution(
+            task=task,
+            config=subagent_config,
+            agent_id=snapshot.node.agent_id,
+            session_id=snapshot.node.session_id,
+        )
+
+        # 3. 构建隔离上下文
+        isolator = ContextIsolator()
+
+        # 收集依赖任务的执行结果
+        dep_results = {}
+        for dep_id in task.depends_on:
+            if dep_id in ctx.task_results:
+                dep_results[dep_id] = ctx.task_results[dep_id]
+
+        isolated_context = isolator.isolate(
+            instruction=task.instruction,
+            task_dependencies=dep_results,
+        )
+
+        # 合并系统提示词
+        isolated_context.system_prompt = subagent_config.system_prompt
+
+        # 4. 构建消息并执行
+        messages = isolated_context.to_messages()
+        user_message = Message(
+            role=MsgRole.USER,
+            content=isolated_context.instruction,
+        )
+
+        # 获取工作目录（用于隔离工具）
+        worktree_path = await orchestrator._subagent_executor.get_workspace_path(task.id)
+
+        try:
+            # 使用基础 Agent 执行任务
+            # 创建一个配置了角色特定提示词的临时 Agent
+            from miniclaw.agents.agent import Agent
+            from miniclaw.config.settings import AgentConfig
+
+            task_agent_config = AgentConfig(
+                system_prompt=subagent_config.system_prompt,
+                max_iterations=subagent_config.max_steps,
+                max_context_tokens=4000,  # Subagent 使用更小的上下文
+                compaction_threshold=0.85,
+            )
+
+            task_agent = Agent(
+                config=task_agent_config,
+                memory_config=orchestrator._settings.memory,
+                provider_registry=orchestrator._agent._provider_registry,
+                tool_registry=orchestrator._agent._tool_registry,
+                session_manager=orchestrator._session_mgr,
+                memory_store=orchestrator._memory,
+            )
+
+            # 执行 ReAct 循环
+            accumulated_result = ""
+            async for event in task_agent.process_message(
+                user_message, snapshot.node.session_id
+            ):
+                if event.event_type.value == "text_delta":
+                    accumulated_result += event.data.get("text", "")
+                elif event.event_type.value == "text_done":
+                    pass  # 文本完成
+                elif event.event_type.value == "tool_call_result":
+                    # 检查是否是 submit_task_result 调用
+                    tool_name = event.data.get("name", "")
+                    if tool_name == "submit_task_result":
+                        result_data = event.data.get("result", "")
+                        # 尝试解析结构化结果
+                        import json
+                        try:
+                            parsed = json.loads(result_data)
+                            result = validate_result(parsed)
+                            # 收集结果
+                            await orchestrator._subagent_executor.collect_result(
+                                task.id, parsed
+                            )
+                            return result.to_master_context()
+                        except json.JSONDecodeError:
+                            accumulated_result += result_data
+
+                elif event.event_type.value == "error":
+                    error_msg = event.data.get("message", "未知错误")
+
+                    # 记录到 Circuit Breaker
+                    if orchestrator._circuit_breaker:
+                        pattern = orchestrator._circuit_breaker.record_failure(
+                            Exception(error_msg)
+                        )
+                        # 注入 Critic 警示
+                        if orchestrator._critic_injector:
+                            orchestrator._critic_injector.record_failure(
+                                tool_name="agent_execution",
+                                tool_arguments={"task_id": task.id},
+                                error=error_msg,
+                                error_pattern=pattern,
+                            )
+
+                    return f"错误: {error_msg}"
+
+            # 如果 Agent 没有调用 submit_task_result，用累积结果构建默认结果
+            if accumulated_result:
+                default_result = validate_result({
+                    "status": "partial_success",
+                    "summary": accumulated_result[:200],
+                    "files_changed": [],
+                    "unresolved_issues": "Agent 未调用 submit_task_result 提交结构化结果",
+                })
+                return default_result.to_master_context()
+            else:
+                return f"任务 '{task.id}' 执行完成，但未产生输出"
+
+        except Exception as e:
+            logger.error("Agent 执行失败: task=%s, error=%s", task.id, e)
+
+            # 记录到 Circuit Breaker
+            if orchestrator._circuit_breaker:
+                orchestrator._circuit_breaker.record_failure(e)
+
+            return f"错误: {str(e)}"
+        finally:
+            # 清理执行环境
+            try:
+                await orchestrator._subagent_executor.finalize_execution(task.id)
+            except Exception as e:
+                logger.warning("清理执行环境失败: %s", e)
 
     async def _simulate_execution(
         self,
@@ -288,11 +481,16 @@ class TaskScheduler:
     def _get_or_create_dag(self, ctx: GraphExecutionContext):
         """获取或创建 DAG 对象
 
-        这里返回一个简化版本的 DAG 结构
+        在执行期间维护一个持久的 DAG，而不是每次调用都重新创建。
         """
         from miniclaw.types.turn_snapshot import TaskDAG
 
-        # 简化实现：直接使用上下文中的信息
+        # 如果已经存在 DAG（Dispatcher 创建的），使用它
+        existing_dag = self._dispatcher._active_dags.get(ctx.graph_id)
+        if existing_dag:
+            return existing_dag
+
+        # 否则创建一个新的
         return TaskDAG(
             dag_id=ctx.graph_id,
             root_node_id=ctx.master_node.agent_id,

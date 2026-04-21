@@ -88,7 +88,7 @@ def tool_decorator(
     """技能装饰器 — 将普通 async 函数包装为 Tool 并注册
 
     示例:
-        @skill_decorator(
+        @tool_decorator(
             name="calculator",
             description="执行数学计算",
             parameters={

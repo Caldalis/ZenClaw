@@ -91,7 +91,6 @@ async def bootstrap_single_agent(config: Settings) -> dict:
 async def bootstrap_master_subagent(config: Settings) -> dict:
     """初始化 Master-Subagent 模式
 
-    这是新的多智能体架构模式。
     """
     logger = get_logger("bootstrap.master_subagent")
     logger.info("初始化 Master-Subagent 模式...")
@@ -220,7 +219,7 @@ async def _init_tools(config: Settings, logger) -> ToolRegistry:
     load_builtin_tools(tool_registry)
     if config.tool_dirs:
         load_tool_dirs(tool_registry, config.tool_dirs)
-    logger.info("技能系统已初始化: %d 个技能 (含 %d 个 SKILL.md)", tool_registry.tool_count, len(skill_manager.available_skills))
+    logger.info("tools系统已初始化: %d 个技能 (含 %d 个 SKILL.md)", tool_registry.tool_count, len(skill_manager.available_skills))
 
     return tool_registry
 

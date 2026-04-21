@@ -13,7 +13,6 @@ from __future__ import annotations
 import json
 from typing import Any, AsyncIterator
 
-from openai import AsyncOpenAI
 
 from miniclaw.types.enums import Role
 from miniclaw.types.messages import Message, ToolCall
@@ -22,6 +21,18 @@ from miniclaw.utils.logging import get_logger
 from .base import AIProvider
 
 logger = get_logger(__name__)
+
+
+def _get_async_openai():
+    """延迟导入 openai — 避免在没有安装 openai 包时阻止模块导入"""
+    try:
+        from openai import AsyncOpenAI
+        return AsyncOpenAI
+    except ImportError:
+        raise ImportError(
+            "openai 包未安装。如需使用 openai 提供商，请运行: pip install openai"
+        )
+
 
 
 class OpenAIProvider(AIProvider):
@@ -33,6 +44,7 @@ class OpenAIProvider(AIProvider):
         self._model = model
         self._max_tokens = max_tokens
         self._temperature = temperature
+        AsyncOpenAI = _get_async_openai()
         self._client = AsyncOpenAI(api_key=api_key, base_url=base_url)
 
     @property

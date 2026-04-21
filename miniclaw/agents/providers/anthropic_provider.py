@@ -13,8 +13,6 @@ from __future__ import annotations
 import json
 from typing import Any, AsyncIterator
 
-from anthropic import AsyncAnthropic
-
 from miniclaw.types.enums import Role
 from miniclaw.types.messages import Message, ToolCall
 from miniclaw.utils.logging import get_logger
@@ -22,6 +20,17 @@ from miniclaw.utils.logging import get_logger
 from .base import AIProvider
 
 logger = get_logger(__name__)
+
+
+def _get_async_anthropic():
+    """延迟导入 anthropic — 避免在没有安装 anthropic 包时阻止模块导入"""
+    try:
+        from anthropic import AsyncAnthropic
+        return AsyncAnthropic
+    except ImportError:
+        raise ImportError(
+            "anthropic 包未安装。如需使用 Anthropic 提供商，请运行: pip install anthropic"
+        )
 
 
 class AnthropicProvider(AIProvider):
@@ -32,6 +41,7 @@ class AnthropicProvider(AIProvider):
         self._model = model
         self._max_tokens = max_tokens
         self._temperature = temperature
+        AsyncAnthropic = _get_async_anthropic()
         self._client = AsyncAnthropic(api_key=api_key)
 
     @property

@@ -15,7 +15,6 @@ from __future__ import annotations
 import json
 from typing import Any, AsyncIterator, Callable, Awaitable
 
-from miniclaw.agents.agent import Agent
 from miniclaw.sessions.manager import SessionManager
 from miniclaw.types.enums import EventType, Role
 from miniclaw.types.events import Event
@@ -33,11 +32,14 @@ logger = get_logger(__name__)
 # 发送回调类型: 将 JSON dict 发送给客户端
 SendCallback = Callable[[dict[str, Any]], Awaitable[None]]
 
+# Agent 协议 — 任何有 process_message 方法的对象都可作为 Agent
+AgentProtocol = Any  # 兼容 Agent 和 MasterAgent
+
 
 class MessageRouter:
     """消息路由器 — 处理客户端请求"""
 
-    def __init__(self, agent: Agent, session_manager: SessionManager, auth: TokenAuth):
+    def __init__(self, agent: AgentProtocol, session_manager: SessionManager, auth: TokenAuth):
         self._agent = agent
         self._session_mgr = session_manager
         self._auth = auth
