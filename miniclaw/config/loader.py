@@ -12,6 +12,7 @@ import yaml
 
 from .settings import Settings
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
 def load_config(config_path: str | Path | None = None) -> Settings:
     """加载配置
@@ -30,6 +31,10 @@ def load_config(config_path: str | Path | None = None) -> Settings:
         for candidate in ["config.yaml", "config.yml", "config.example.yaml"]:
             if Path(candidate).exists():
                 config_path = candidate
+                break
+            project_path = PROJECT_ROOT / candidate
+            if project_path.exists():
+                config_path = str(project_path)
                 break
 
     if config_path and Path(config_path).exists():
@@ -87,3 +92,6 @@ def _apply_env_overrides(data: dict) -> None:
     debug = os.environ.get("MINICLAW_DEBUG")
     if debug and debug.lower() in ("1", "true", "yes"):
         data["debug"] = True
+    execution_mode = os.environ.get("MINICLAW_EXECUTION_MODE")
+    if execution_mode:
+        data["execution_mode"] = execution_mode

@@ -20,6 +20,7 @@ from enum import Enum
 from typing import Any, Callable
 
 from miniclaw.agents.critic.validation_tools import ValidationStatus, ValidationResult
+from miniclaw.tools.base import Tool
 from miniclaw.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -285,10 +286,11 @@ class ValidationGatekeeper:
         }
 
 
-class ValidationAwareSubmitTool:
+class ValidationAwareSubmitTool(Tool):
     """验证感知的提交工具包装器
 
     在 submit_task_result 工具执行前检查验证状态。
+    继承 Tool 以兼容 ToolRegistry.register()。
     """
 
     def __init__(

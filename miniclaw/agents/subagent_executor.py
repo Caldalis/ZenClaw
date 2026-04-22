@@ -72,6 +72,7 @@ class SubagentExecutor:
         config: SubagentConfig,
         agent_id: str,
         session_id: str,
+        parent_branch: str | None = None,
     ) -> SubagentExecutionContext:
         """准备执行环境
 
@@ -80,6 +81,7 @@ class SubagentExecutor:
             config: Subagent 配置
             agent_id: Agent ID
             session_id: 会话 ID
+            parent_branch: worktree 的基础分支。有依赖时传入依赖任务的分支名。
 
         Returns:
             SubagentExecutionContext: 执行上下文
@@ -96,6 +98,7 @@ class SubagentExecutor:
                 agent_id=agent_id,
                 session_id=session_id,
                 requires_worktree=True,
+                parent_branch=parent_branch,
             )
             ctx.workspace = workspace
 
@@ -120,6 +123,13 @@ class SubagentExecutor:
         ctx = self._contexts.get(task_id)
         if ctx and ctx.workspace:
             return ctx.workspace.worktree_path
+        return None
+
+    async def get_workspace_branch(self, task_id: str) -> str | None:
+        """获取任务的 worktree 分支名（用于依赖任务的 parent_branch）"""
+        ctx = self._contexts.get(task_id)
+        if ctx and ctx.workspace and ctx.workspace.worktree_info:
+            return ctx.workspace.worktree_info.branch_name
         return None
 
     async def collect_result(
@@ -155,17 +165,22 @@ class SubagentExecutor:
     async def finalize_execution(
         self,
         task_id: str,
+        merge_and_cleanup: bool = True,
     ) -> dict[str, Any]:
         """完成执行
 
         流程:
           1. 检查是否有变更
           2. 提交变更（如果有）
-          3. 合并到主干（如果成功）
-          4. 清理 worktree
+          3. 合并到主干（如果成功且 merge_and_cleanup=True）
+          4. 清理 worktree（如果 merge_and_cleanup=True）
+
+        当任务有下游依赖时应设 merge_and_cleanup=False，
+        仅提交变更保留分支供依赖任务使用。
 
         Args:
             task_id: 任务 ID
+            merge_and_cleanup: 是否合并到主干并清理 worktree
 
         Returns:
             完成状态
@@ -190,14 +205,16 @@ class SubagentExecutor:
         finalize_result = await self._isolator.finalize_workspace(
             workspace_id=task_id,
             result=ctx.result,
+            merge_and_cleanup=merge_and_cleanup,
         )
 
         finalize_result["finalized"] = True
         finalize_result["task_id"] = task_id
         finalize_result["used_worktree"] = True
 
-        # 清理上下文
-        del self._contexts[task_id]
+        # 仅在已合并/清理后删除上下文，否则保留给 DAG 级清理
+        if merge_and_cleanup or ctx.workspace is None or ctx.workspace.is_merged:
+            del self._contexts[task_id]
 
         return finalize_result
 

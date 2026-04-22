@@ -5,7 +5,16 @@
 from __future__ import annotations
 
 from enum import Enum
+from pathlib import Path
 from pydantic import BaseModel, Field
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+
+
+def resolve_path(path: str | Path, base: Path = PROJECT_ROOT) -> str:
+    """将相对路径解析为绝对路径（基于项目根目录），绝对路径保持不变"""
+    p = Path(path)
+    return str(p) if p.is_absolute() else str(base / p)
 
 
 class ExecutionMode(str, Enum):
@@ -81,6 +90,9 @@ class SubagentConfig(BaseModel):
     require_validation: bool = True       # 是否强制验证闭环
     validation_requirement: str = "any"   # any | linter | tests | both
 
+    # Master Agent 循环配置
+    max_task_graph_rounds: int = 3        # 单次消息最大 DAG 创建轮数
+
 
 class Settings(BaseModel):
     """MiniClaw 全局配置 — 所有模块的配置汇总
@@ -108,6 +120,13 @@ class Settings(BaseModel):
     tool_dirs: list[str] = Field(default_factory=list)
     # 调试模式
     debug: bool = False
+
+    def model_post_init(self, __context) -> None:
+        """将所有相对路径解析为项目根目录下的绝对路径"""
+        self.memory.db_path = resolve_path(self.memory.db_path)
+        self.subagent.worktree_base_dir = resolve_path(self.subagent.worktree_base_dir)
+        self.skill_dirs = [resolve_path(d) for d in self.skill_dirs]
+        self.tool_dirs = [resolve_path(d) for d in self.tool_dirs]
 
     def is_master_subagent_mode(self) -> bool:
         """是否为 Master-Subagent 模式"""

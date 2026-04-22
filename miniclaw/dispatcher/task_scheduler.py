@@ -85,18 +85,22 @@ class TaskScheduler:
         self,
         request: TaskGraphRequest,
         master_node: AgentNode,
+        graph_id: str | None = None,
     ) -> TaskGraphResult:
         """调度执行任务图
 
         Args:
             request: 任务图请求（从 create_task_graph 工具解析）
             master_node: Master Agent 的节点信息
+            graph_id: 已有的任务图 ID（复用 create_task_graph 工具生成的 ID）
 
         Returns:
             TaskGraphResult: 任务图执行结果
         """
-        # 构建结果对象
+        # 构建结果对象 — 复用已有的 graph_id 而非重新生成
         result = build_task_graph_result(request)
+        if graph_id:
+            result.graph_id = graph_id
 
         # 创建执行上下文
         ctx = GraphExecutionContext(
@@ -154,6 +158,7 @@ class TaskScheduler:
         """按层级执行任务
 
         同层级的任务可并行执行，层级间必须顺序执行。
+        DAG 完成后统一合并和清理所有 worktree。
         """
         task_map = {t.id: t for t in ctx.request.tasks}
 
@@ -179,6 +184,9 @@ class TaskScheduler:
                 batch = remaining[:batch_size]
                 remaining = remaining[batch_size:]
                 await self._execute_parallel(ctx, batch, task_map)
+
+        # DAG 完成后统一合并和清理所有延迟的 worktree
+        await self._finalize_dag_worktrees(ctx)
 
     async def _execute_parallel(
         self,
@@ -290,18 +298,28 @@ class TaskScheduler:
         """通过 Orchestrator 执行真实 Agent
 
         使用 SubagentExecutor 运行 Agent 的 ReAct 循环：
-          1. 准备执行环境（Worktree + 隔离工具）
-          2. 构建隔离上下文
-          3. 调用 Agent.process_message 执行
-          4. 收集结果并验证
-          5. 失败时检查 Circuit Breaker
+          1. 检查 CircuitBreaker 熔断状态
+          2. 准备执行环境（Worktree + 隔离工具）
+          3. 构建隔离上下文 + Critic 警示注入
+          4. 构建 per-task ToolRegistry（隔离工具 + 验证工具 + 门禁）
+          5. 调用 Agent.process_message 执行
+          6. 收集结果并验证
+          7. 成功时 record_success，失败时 record_failure + Critic 注入
         """
         from miniclaw.agents.context_isolator import ContextIsolator
+        from miniclaw.agents.critic.validation_gatekeeper import ValidationAwareSubmitTool
+        from miniclaw.agents.critic.validation_tools import RunLinterTool, RunTestsTool
+        from miniclaw.tools.registry import ToolRegistry
         from miniclaw.types.structured_result import validate_result
         from miniclaw.types.messages import Message
         from miniclaw.types.enums import Role as MsgRole
 
         orchestrator = self._orchestrator
+
+        # 0. 检查 CircuitBreaker — 如果已熔断，直接中断
+        if orchestrator._circuit_breaker and orchestrator._circuit_breaker.is_open:
+            logger.warning("CircuitBreaker 已熔断，中断任务: %s", task.id)
+            raise orchestrator._circuit_breaker.get_breaker_error()
 
         # 1. 创建 Subagent 配置
         subagent_config = orchestrator._factory.create_config(
@@ -310,15 +328,37 @@ class TaskScheduler:
             session_id=snapshot.node.session_id,
         )
 
-        # 2. 准备执行环境
+        # 1b. 查找依赖任务的 worktree 分支，使依赖产物可见
+        parent_branch = None
+        for dep_id in task.depends_on:
+            dep_branch = await orchestrator._subagent_executor.get_workspace_branch(dep_id)
+            if dep_branch:
+                parent_branch = dep_branch
+                logger.info(
+                    "任务 %s 基于依赖 %s 的分支 %s 创建 worktree",
+                    task.id, dep_id, dep_branch,
+                )
+                break  # 使用第一个有分支的依赖
+
+        # 2. 准备执行环境（Worktree + 隔离工具）
         exec_ctx = await orchestrator._subagent_executor.prepare_for_execution(
             task=task,
             config=subagent_config,
             agent_id=snapshot.node.agent_id,
             session_id=snapshot.node.session_id,
+            parent_branch=parent_branch,
         )
 
-        # 3. 构建隔离上下文
+        # 2b. Worktree 失败策略：如果需要 worktree 但创建失败，直接中断
+        if subagent_config.requires_worktree:
+            if exec_ctx.workspace is None or exec_ctx.workspace.worktree_path is None:
+                logger.error("Worktree 创建失败，任务中断: %s", task.id)
+                return f"错误: Git Worktree 创建失败，无法保证文件隔离安全"
+
+        # 3. 重置验证门禁器（每个子任务独立验证状态）
+        orchestrator.reset_validation()
+
+        # 4. 构建隔离上下文
         isolator = ContextIsolator()
 
         # 收集依赖任务的执行结果
@@ -332,29 +372,78 @@ class TaskScheduler:
             task_dependencies=dep_results,
         )
 
-        # 合并系统提示词
-        isolated_context.system_prompt = subagent_config.system_prompt
+        # 4b. 合并系统提示词 + Critic 警示注入
+        system_prompt = subagent_config.system_prompt
+        if orchestrator._critic_injector and orchestrator._critic_injector.has_recent_failure():
+            warning = orchestrator._critic_injector.get_warning_prompt()
+            system_prompt += "\n\n" + warning
+            logger.info("Critic 警示已注入到任务 %s 的提示词", task.id)
+        isolated_context.system_prompt = system_prompt
 
-        # 4. 构建消息并执行
+        # 5. 构建 per-task ToolRegistry
         messages = isolated_context.to_messages()
         user_message = Message(
             role=MsgRole.USER,
             content=isolated_context.instruction,
         )
 
-        # 获取工作目录（用于隔离工具）
         worktree_path = await orchestrator._subagent_executor.get_workspace_path(task.id)
 
+        task_tool_registry = ToolRegistry()
+
+        # 需要替换的文件/终端工具名
+        isolated_tool_names = {"file_reader", "file_writer", "terminal"}
+
+        # 从 Master 工具表复制非隔离、非提交工具
+        for tool in orchestrator._agent._tool_registry.list_tools():
+            if tool.name not in isolated_tool_names and tool.name != "submit_task_result":
+                task_tool_registry.register(tool)
+
+        # 如果启用了 worktree 隔离，用 IsolatedToolSet 替换文件/终端工具
+        if subagent_config.requires_worktree and exec_ctx.tool_set:
+            for isolated_tool in exec_ctx.tool_set.get_tools():
+                task_tool_registry.register(isolated_tool)
+            logger.info(
+                "任务 %s 使用 IsolatedToolSet (worktree=%s)",
+                task.id, worktree_path,
+            )
+        else:
+            # 不需要 worktree — 保留原始文件/终端工具
+            for tool_name in isolated_tool_names:
+                tool = orchestrator._agent._tool_registry.get(tool_name)
+                if tool:
+                    task_tool_registry.register(tool)
+
+        # 注册验证工具 (run_linter, run_tests)，指向正确的 worktree_root
+        validation_root = worktree_path if worktree_path else orchestrator._repo_root
+        linter_tool = RunLinterTool(worktree_root=validation_root)
+        test_tool = RunTestsTool(worktree_root=validation_root)
+        task_tool_registry.register(linter_tool)
+        task_tool_registry.register(test_tool)
+        logger.info("验证工具已注册: run_linter, run_tests (root=%s)", validation_root)
+
+        # 包装 submit_task_result：如果 require_validation 则用 ValidationAwareSubmitTool
+        original_submit = orchestrator._agent._tool_registry.get("submit_task_result")
+        if original_submit:
+            if orchestrator._settings.subagent.require_validation and orchestrator._validation_gatekeeper:
+                wrapped_submit = ValidationAwareSubmitTool(
+                    gatekeeper=orchestrator._validation_gatekeeper,
+                    original_submit_tool=original_submit,
+                )
+                task_tool_registry.register(wrapped_submit)
+                logger.info("submit_task_result 已包装为 ValidationAwareSubmitTool")
+            else:
+                task_tool_registry.register(original_submit)
+
         try:
-            # 使用基础 Agent 执行任务
-            # 创建一个配置了角色特定提示词的临时 Agent
+            # 6. 创建并执行 Subagent Agent
             from miniclaw.agents.agent import Agent
             from miniclaw.config.settings import AgentConfig
 
             task_agent_config = AgentConfig(
-                system_prompt=subagent_config.system_prompt,
+                system_prompt=system_prompt,
                 max_iterations=subagent_config.max_steps,
-                max_context_tokens=4000,  # Subagent 使用更小的上下文
+                max_context_tokens=4000,
                 compaction_threshold=0.85,
             )
 
@@ -362,9 +451,10 @@ class TaskScheduler:
                 config=task_agent_config,
                 memory_config=orchestrator._settings.memory,
                 provider_registry=orchestrator._agent._provider_registry,
-                tool_registry=orchestrator._agent._tool_registry,
+                tool_registry=task_tool_registry,
                 session_manager=orchestrator._session_mgr,
                 memory_store=orchestrator._memory,
+                validation_gatekeeper=orchestrator._validation_gatekeeper,
             )
 
             # 执行 ReAct 循环
@@ -375,21 +465,34 @@ class TaskScheduler:
                 if event.event_type.value == "text_delta":
                     accumulated_result += event.data.get("text", "")
                 elif event.event_type.value == "text_done":
-                    pass  # 文本完成
+                    pass
                 elif event.event_type.value == "tool_call_result":
-                    # 检查是否是 submit_task_result 调用
                     tool_name = event.data.get("name", "")
                     if tool_name == "submit_task_result":
                         result_data = event.data.get("result", "")
+                        # 检查是否被 ValidationAwareSubmitTool 拦截（返回阻止消息）
+                        if result_data.startswith("**提交被阻止**"):
+                            logger.warning(
+                                "任务 %s 的 submit_task_result 被验证门禁拦截",
+                                task.id,
+                            )
+                            accumulated_result += result_data
+                            continue
+
                         # 尝试解析结构化结果
                         import json
                         try:
                             parsed = json.loads(result_data)
                             result = validate_result(parsed)
-                            # 收集结果
                             await orchestrator._subagent_executor.collect_result(
                                 task.id, parsed
                             )
+
+                            # 成功提交 — 记录到 CircuitBreaker
+                            if orchestrator._circuit_breaker:
+                                orchestrator._circuit_breaker.record_success()
+                            orchestrator.reset_critic()
+
                             return result.to_master_context()
                         except json.JSONDecodeError:
                             accumulated_result += result_data
@@ -402,7 +505,7 @@ class TaskScheduler:
                         pattern = orchestrator._circuit_breaker.record_failure(
                             Exception(error_msg)
                         )
-                        # 注入 Critic 警示
+                        # 记录到 Critic 注入器
                         if orchestrator._critic_injector:
                             orchestrator._critic_injector.record_failure(
                                 tool_name="agent_execution",
@@ -413,7 +516,7 @@ class TaskScheduler:
 
                     return f"错误: {error_msg}"
 
-            # 如果 Agent 没有调用 submit_task_result，用累积结果构建默认结果
+            # Agent 未调用 submit_task_result — 用累积结果构建默认结果
             if accumulated_result:
                 default_result = validate_result({
                     "status": "partial_success",
@@ -421,6 +524,12 @@ class TaskScheduler:
                     "files_changed": [],
                     "unresolved_issues": "Agent 未调用 submit_task_result 提交结构化结果",
                 })
+
+                # 部分成功也记录
+                if orchestrator._circuit_breaker:
+                    orchestrator._circuit_breaker.record_success()
+                orchestrator.reset_critic()
+
                 return default_result.to_master_context()
             else:
                 return f"任务 '{task.id}' 执行完成，但未产生输出"
@@ -432,11 +541,24 @@ class TaskScheduler:
             if orchestrator._circuit_breaker:
                 orchestrator._circuit_breaker.record_failure(e)
 
+            # 记录到 Critic 注入器
+            if orchestrator._critic_injector:
+                orchestrator._critic_injector.record_failure(
+                    tool_name="agent_execution",
+                    tool_arguments={"task_id": task.id},
+                    error=str(e),
+                )
+
             return f"错误: {str(e)}"
         finally:
             # 清理执行环境
+            # 如果该任务有下游依赖（其他任务的 depends_on 包含此任务），
+            # 仅提交变更保留分支，不合并/清理，使依赖任务可基于此分支创建 worktree
+            is_dependency = self._is_dependency_task(task, ctx)
             try:
-                await orchestrator._subagent_executor.finalize_execution(task.id)
+                await orchestrator._subagent_executor.finalize_execution(
+                    task.id, merge_and_cleanup=not is_dependency,
+                )
             except Exception as e:
                 logger.warning("清理执行环境失败: %s", e)
 
@@ -496,6 +618,69 @@ class TaskScheduler:
             root_node_id=ctx.master_node.agent_id,
             nodes={ctx.master_node.agent_id: ctx.master_node},
         )
+
+    def _is_dependency_task(
+        self,
+        task: TaskNode,
+        ctx: GraphExecutionContext,
+    ) -> bool:
+        """检查该任务是否有下游依赖（其他任务的 depends_on 包含此任务）
+
+        有下游依赖的任务在执行结束后仅提交变更，不合并/清理 worktree，
+        使依赖任务可基于此分支创建 worktree。
+        """
+        for other_task in ctx.request.tasks:
+            if task.id in other_task.depends_on:
+                return True
+        return False
+
+    async def _finalize_dag_worktrees(self, ctx: GraphExecutionContext) -> None:
+        """DAG 完成后统一合并和清理所有延迟的 worktree
+
+        之前因为有下游依赖而仅提交（未合并/清理）的 worktree，
+        在这里统一执行合并到主干和清理操作。
+        """
+        if self._orchestrator is None:
+            return
+
+        executor = self._orchestrator._subagent_executor
+        for task_id in list(executor._contexts.keys()):
+            ctx_obj = executor._contexts.get(task_id)
+            if ctx_obj is None or ctx_obj.workspace is None:
+                continue
+
+            workspace = ctx_obj.workspace
+            if workspace.worktree_info is None or not workspace.is_committed:
+                # 未使用 worktree 或未提交变更，跳过
+                continue
+
+            if workspace.is_merged:
+                # 已合并（可能是没有依赖的任务），跳过
+                continue
+
+            try:
+                # 合并到主干
+                merge_result = await executor._isolator._worktree_mgr.merge_to_parent(
+                    worktree_id=task_id,
+                    delete_branch=executor._isolator._auto_cleanup,
+                )
+                workspace.is_merged = merge_result.get("merged", False)
+
+                logger.info(
+                    "DAG worktree 已合并: task=%s, merged=%s",
+                    task_id, workspace.is_merged,
+                )
+
+                # 清理 worktree
+                if executor._isolator._auto_cleanup:
+                    await executor._isolator._worktree_mgr.remove_worktree(
+                        worktree_id=task_id,
+                        force=True,
+                    )
+                    workspace.is_active = False
+
+            except Exception as e:
+                logger.warning("DAG worktree 合并/清理失败: task=%s, error=%s", task_id, e)
 
     async def wait_for_results(
         self,

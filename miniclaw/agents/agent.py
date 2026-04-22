@@ -3,20 +3,6 @@
 
 Agent 是整个系统的核心，实现了 AI 对话 + 工具调用循环:
 
-  ┌─────────────────────────────────────────────┐
-  │              Agent.process_message()         │
-  │                                             │
-  │  1. 构建上下文 (ContextWindow)               │
-  │  2. 调用 AI (Provider)                       │
-  │  3. AI 回复是否包含工具调用?                   │
-  │     ├─ 是 → 执行工具 (ToolExecutor)           │
-  │     │       将结果加入上下文                   │
-  │     │       回到步骤 2 (循环)                  │
-  │     └─ 否 → 返回最终文本回复                   │
-  │                                             │
-  │  产出事件流: AsyncIterator[Event]             │
-  └─────────────────────────────────────────────┘
-
 关键设计:
   - 事件驱动: 不返回字符串，产出 Event 流
   - 工具调用循环: 多轮调用直到 AI 不再请求工具
@@ -26,7 +12,7 @@ Agent 是整个系统的核心，实现了 AI 对话 + 工具调用循环:
 
 from __future__ import annotations
 
-from typing import AsyncIterator
+from typing import AsyncIterator, Any
 
 from miniclaw.agents.providers.registry import ProviderRegistry
 from miniclaw.agents.streaming import process_stream
@@ -68,6 +54,7 @@ class Agent:
         session_manager: SessionManager,
         memory_store: MemoryStore,
         memory_config: MemoryConfig | None = None,
+        validation_gatekeeper: Any | None = None,
     ):
         self._config = config
         self._providers = provider_registry
@@ -76,7 +63,11 @@ class Agent:
         self._memory = memory_store
 
         mem_cfg = memory_config or MemoryConfig()
-        self._tool_executor = ToolExecutor(tool_registry, tool_result_max_bytes=mem_cfg.tool_result_max_bytes)
+        self._tool_executor = ToolExecutor(
+            tool_registry,
+            tool_result_max_bytes=mem_cfg.tool_result_max_bytes,
+            validation_gatekeeper=validation_gatekeeper,
+        )
         self._context_window = ContextWindow(config.max_context_tokens)
         self._context_guard = ContextGuard(
             max_context_tokens=config.max_context_tokens,

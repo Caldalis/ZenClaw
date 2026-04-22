@@ -106,6 +106,7 @@ class WorkspaceIsolator:
         agent_id: str,
         session_id: str,
         requires_worktree: bool = True,
+        parent_branch: str | None = None,
     ) -> IsolatedWorkspace:
         """准备工作空间
 
@@ -116,6 +117,9 @@ class WorkspaceIsolator:
             agent_id: Agent ID
             session_id: 会话 ID
             requires_worktree: 是否需要 Git Worktree 隔离
+            parent_branch: worktree 的基础分支。None 则自动检测默认分支。
+                当任务有依赖时，应传入已完成依赖任务的分支名，
+                使依赖产物可见。
 
         Returns:
             IsolatedWorkspace: 准备好的工作空间
@@ -138,7 +142,7 @@ class WorkspaceIsolator:
             try:
                 worktree_info = await self._worktree_mgr.create_worktree(
                     worktree_id=workspace_id,
-                    parent_branch="main",  # 可配置
+                    parent_branch=parent_branch,
                     branch_prefix="subagent",
                 )
 
@@ -152,8 +156,11 @@ class WorkspaceIsolator:
                 )
 
             except Exception as e:
-                logger.error("创建 worktree 失败: %s", e)
-                raise
+                logger.warning("创建 worktree 失败，降级为非隔离模式: %s", e)
+                workspace.worktree_path = self._worktree_mgr.repo_root
+                workspace.is_active = True
+
+
 
         else:
             # 不需要 worktree，使用仓库根目录
@@ -171,18 +178,24 @@ class WorkspaceIsolator:
         self,
         workspace_id: str,
         result: StructuredResult,
+        merge_and_cleanup: bool = True,
     ) -> dict[str, Any]:
         """完成工作空间
 
         流程:
           1. 检查是否有变更
           2. 提交变更（如果有）
-          3. 合并到主干（如果成功且配置了 auto_merge）
-          4. 清理 worktree（如果配置了 auto_cleanup）
+          3. 合并到主干（如果成功且配置了 auto_merge）— 仅当 merge_and_cleanup=True
+          4. 清理 worktree（如果配置了 auto_cleanup）— 仅当 merge_and_cleanup=True
+
+        当任务有下游依赖时，应设 merge_and_cleanup=False，
+        仅提交变更保留分支，使依赖任务可基于此分支创建 worktree。
+        DAG 全部完成后统一合并清理。
 
         Args:
             workspace_id: 工作空间 ID
             result: 任务结果
+            merge_and_cleanup: 是否执行合并和清理（默认 True）
 
         Returns:
             完成状态
@@ -219,8 +232,8 @@ class WorkspaceIsolator:
                 workspace.is_committed = commit_result.get("committed", False)
                 finalize_result["commit"] = commit_result
 
-            # 如果任务成功且配置了自动合并
-            if result.is_success() and self._auto_merge and workspace.is_committed:
+            # 如果任务成功且配置了自动合并 — 仅在 merge_and_cleanup 模式下执行
+            if merge_and_cleanup and result.is_success() and self._auto_merge and workspace.is_committed:
                 merge_result = await self._worktree_mgr.merge_to_parent(
                     worktree_id=workspace_id,
                     delete_branch=self._auto_cleanup,
@@ -232,8 +245,8 @@ class WorkspaceIsolator:
                 if merge_result.get("has_conflicts"):
                     finalize_result["conflicts"] = merge_result.get("conflict_files", [])
 
-            # 清理 worktree
-            if self._auto_cleanup:
+            # 清理 worktree — 仅在 merge_and_cleanup 模式下执行
+            if merge_and_cleanup and self._auto_cleanup:
                 await self._worktree_mgr.remove_worktree(
                     worktree_id=workspace_id,
                     force=True,

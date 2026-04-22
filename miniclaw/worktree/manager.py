@@ -123,7 +123,7 @@ class WorktreeManager:
     async def create_worktree(
         self,
         worktree_id: str,
-        parent_branch: str = "main",
+        parent_branch: str | None = None,
         branch_prefix: str = "subagent",
     ) -> WorktreeInfo:
         """创建新的 Worktree
@@ -144,6 +144,9 @@ class WorktreeManager:
         if worktree_path.exists():
             logger.warning("Worktree 路径已存在，将清理: %s", worktree_path)
             await self._remove_directory(worktree_path)
+
+        if parent_branch is None:
+            parent_branch = await self._detect_default_branch()
 
         # 创建 worktree
         info = WorktreeInfo(
@@ -193,6 +196,37 @@ class WorktreeManager:
             info.error_message = str(e)
             logger.error("创建 worktree 失败: %s", e)
             raise
+
+    async def _detect_default_branch(self) -> str:
+        # """检测仓库的默认分支名 (main, master, 等)"""
+        #
+        # result = await self._run_git_command(["symbolic-ref", "--short", "HEAD"], cwd=self.repo_root)
+        # if result["exit_code"] == 0 and result["stdout"].strip():
+        #     return result["stdout"].strip()
+        # result = await self._run_git_command(["config", "init.defaultBranch"], cwd=self.repo_root)
+        # if result["exit_code"] == 0 and result["stdout"].strip():
+        #     return result["stdout"].strip()
+        # return "main"
+
+        """检测仓库的默认分支名，并验证分支确实存在"""
+        candidates = []
+        result = await self._run_git_command(["symbolic-ref", "--short", "HEAD"], cwd=self.repo_root)
+        if result["exit_code"] == 0 and result["stdout"].strip():
+            candidates.append(result["stdout"].strip())
+        result = await self._run_git_command(["config", "init.defaultBranch"], cwd=self.repo_root)
+        if result["exit_code"] == 0 and result["stdout"].strip():
+            candidates.append(result["stdout"].strip())
+        candidates.extend(["main", "master"])
+        seen = set()
+        candidates = [c for c in candidates if c not in seen and not seen.add(c)]
+        for branch in candidates:
+            result = await self._run_git_command(["rev-parse", "--verify", branch], cwd=self.repo_root)
+            if result["exit_code"] == 0:
+                return branch
+            result = await self._run_git_command(["rev-parse", "--verify", f"origin/{branch}"], cwd=self.repo_root)
+            if result["exit_code"] == 0:
+                return f"origin/{branch}"
+        raise RuntimeError(f"无法检测到有效的默认分支: {self.repo_root}（候选: {candidates}）")
 
     async def get_worktree(self, worktree_id: str) -> WorktreeInfo | None:
         """获取 worktree 信息"""

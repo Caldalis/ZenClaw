@@ -14,9 +14,8 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable
+from typing import Any, Callable
 
 from miniclaw.agents.agent import Agent
 from miniclaw.agents.critic.circuit_breaker import (
@@ -40,11 +39,7 @@ from miniclaw.dispatcher.subagent_registry import GuardrailConfig, SubagentRegis
 from miniclaw.dispatcher.task_scheduler import TaskScheduler
 from miniclaw.memory.base import MemoryStore
 from miniclaw.sessions.manager import SessionManager
-from miniclaw.tools.builtin.create_task_graph import get_pending_graph, clear_pending_graph
-from miniclaw.tools.builtin.submit_task_result import submit_task_result_tool
 from miniclaw.types.enums import AgentRole
-from miniclaw.types.events import Event
-from miniclaw.types.messages import Message
 from miniclaw.types.structured_result import StructuredResult, TaskStatus, validate_result
 from miniclaw.types.task_graph import TaskGraphRequest, TaskGraphResult, TaskNode
 from miniclaw.types.turn_snapshot import AgentNode
@@ -139,6 +134,7 @@ class SubagentOrchestrator:
         # 5. 初始化 SubagentExecutor
         self._subagent_executor = await create_subagent_executor(
             repo_root=self._repo_root,
+            worktree_base=subagent_cfg.worktree_base_dir,
             auto_merge=subagent_cfg.auto_merge,
             auto_cleanup=subagent_cfg.auto_cleanup,
         )
@@ -180,120 +176,35 @@ class SubagentOrchestrator:
 
         logger.info("SubagentOrchestrator 已关闭")
 
-    async def process_message(
+    async def create_root_dag(
         self,
-        user_message: Message,
+        root_agent_id: str,
         session_id: str,
-    ) -> AsyncIterator[Event]:
-        """处理用户消息（Master Agent 入口）
+    ) -> str:
+        """创建根 DAG，用于 Dispatcher 状态跟踪
 
-        流程:
-          1. Master Agent 分析任务
-          2. 如果需要分解，调用 create_task_graph
-          3. 调度执行子任务
-          4. 收集结果
-          5. 返回最终响应
+        MasterAgent 在状态机循环开始前调用此方法，
+        确保子任务执行时 Dispatcher 有完整的 DAG 树。
+
+        Returns:
+            dag_id: 创建的 DAG ID
         """
-        # 创建 Master Agent 节点
-        master_node = AgentNode(
-            agent_id="master-001",
-            role=AgentRole.MASTER,
-            depth=0,
-            session_id=session_id,
-        )
-
-        # 创建 DAG
+        if self._dispatcher is None:
+            raise RuntimeError("Dispatcher 未初始化")
         dag = await self._dispatcher.create_dag(
-            root_agent_id=master_node.agent_id,
+            root_agent_id=root_agent_id,
             session_id=session_id,
         )
-
         self._state.current_graph_id = dag.dag_id
-
-        # 调用 Master Agent 处理
-        yield Event.thinking(session_id)
-
-        try:
-            # 运行 Master Agent
-            accumulated_content = ""
-            tool_call_detected = False
-            graph_id = None
-
-            async for event in self._agent.process_message(user_message, session_id):
-                yield event
-
-                # 检查是否有 create_task_graph 调用
-                if event.event_type.value == "tool_call_start":
-                    if event.data.get("name") == "create_task_graph":
-                        tool_call_detected = True
-
-                if event.event_type.value == "tool_call_result":
-                    result_data = event.data.get("result", "")
-                    # 尝试解析 graph_id
-                    import json
-                    try:
-                        result_json = json.loads(result_data)
-                        graph_id = result_json.get("graph_id")
-                    except:
-                        pass
-
-                if event.event_type.value == "text_delta":
-                    accumulated_content += event.data.get("text", "")
-
-            # 如果检测到任务图，执行调度
-            if tool_call_detected and graph_id:
-                logger.info("检测到任务图: %s，开始调度执行", graph_id)
-
-                # 获取任务图请求
-                graph_request = get_pending_graph(graph_id)
-                if graph_request:
-                    # 执行任务图
-                    graph_result = await self._execute_task_graph(
-                        graph_request,
-                        master_node,
-                        session_id,
-                    )
-
-                    # 将结果注入到对话中
-                    result_summary = self._format_graph_result(graph_result)
-
-                    # 继续让 Master Agent 处理结果
-                    result_message = Message(
-                        role="user",
-                        content=f"[任务图执行结果]\n{result_summary}",
-                    )
-
-                    async for event in self._agent.process_message(result_message, session_id):
-                        yield event
-
-                    # 清理
-                    clear_pending_graph(graph_id)
-
-        except CircuitBreakerError as e:
-            logger.error("熔断触发: %s", e)
-            yield Event.error(f"任务执行中断: {str(e)}", session_id)
-
-        except Exception as e:
-            logger.error("处理消息失败: %s", e)
-            yield Event.error(f"处理失败: {str(e)}", session_id)
-
-        finally:
-            yield Event.done(session_id)
-
-    async def _execute_task_graph(
-        self,
-        request: TaskGraphRequest,
-        master_node: AgentNode,
-        session_id: str,
-    ) -> TaskGraphResult:
-        """执行任务图（内部方法，由 process_message 调用）"""
-        return await self.execute_task_graph(request, master_node)
+        logger.info("根 DAG 已创建: %s", dag.dag_id)
+        return dag.dag_id
 
     async def execute_task_graph(
         self,
         request: TaskGraphRequest,
         master_node: AgentNode,
         timeout_seconds: int = 300,
+        graph_id: str | None = None,
     ) -> TaskGraphResult:
         """执行任务图（外部入口，由 MasterAgent._wait_for_graph_result 调用）
 
@@ -301,6 +212,7 @@ class SubagentOrchestrator:
             request: 任务图请求
             master_node: Master Agent 节点
             timeout_seconds: 总超时时间
+            graph_id: 已有的任务图 ID（复用 create_task_graph 生成的 ID）
 
         Returns:
             TaskGraphResult: 执行结果
@@ -314,7 +226,7 @@ class SubagentOrchestrator:
         # 执行调度
         try:
             result = await asyncio.wait_for(
-                self._scheduler.schedule(request, master_node),
+                self._scheduler.schedule(request, master_node, graph_id=graph_id),
                 timeout=timeout_seconds,
             )
         except asyncio.TimeoutError:
@@ -334,28 +246,6 @@ class SubagentOrchestrator:
             )
 
         return result
-
-    def _format_graph_result(self, result: TaskGraphResult) -> str:
-        """格式化任务图结果"""
-        lines = [
-            f"**任务图执行完成**",
-            f"- 总任务数: {result.total_tasks}",
-            f"- 成功: {len(result.completed_tasks)}",
-            f"- 失败: {len(result.failed_tasks)}",
-            "",
-        ]
-
-        if result.completed_tasks:
-            lines.append("**已完成任务**:")
-            for task_id in result.completed_tasks:
-                lines.append(f"  ✓ {task_id}")
-
-        if result.failed_tasks:
-            lines.append("**失败任务**:")
-            for task_id in result.failed_tasks:
-                lines.append(f"  ✗ {task_id}")
-
-        return "\n".join(lines)
 
     async def spawn_subagent(
         self,
@@ -456,6 +346,18 @@ class SubagentOrchestrator:
         if self._validation_gatekeeper is None:
             raise RuntimeError("ValidationGatekeeper 未初始化")
         return self._validation_gatekeeper
+
+    def reset_validation(self) -> None:
+        """重置验证门禁器状态（每个子任务执行前调用）"""
+        if self._validation_gatekeeper:
+            self._validation_gatekeeper.reset()
+            logger.debug("验证门禁器已重置")
+
+    def reset_critic(self) -> None:
+        """重置 Critic 注入器状态（任务成功后调用）"""
+        if self._critic_injector:
+            self._critic_injector.clear()
+            logger.debug("Critic 注入器已清除")
 
     async def get_status(self) -> dict[str, Any]:
         """获取编排器状态"""

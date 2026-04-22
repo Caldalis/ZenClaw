@@ -15,6 +15,7 @@ from typing import Any
 
 import yaml
 
+from miniclaw.config.settings import PROJECT_ROOT
 from miniclaw.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -30,9 +31,9 @@ class SkillManager:
     def __init__(self, skills_dirs: list[str] | None = None):
         """
         Args:
-            skills_dirs: 要扫描的技能目录列表，默认 ["./skills"]
+            skills_dirs: 要扫描的技能目录列表，默认为项目根目录下的 skills
         """
-        self._skills_dirs = skills_dirs or ["./skills"]
+        self._skills_dirs = skills_dirs or [str(PROJECT_ROOT / "skills")]
         self._available_skills: dict[str, dict[str, str]] = {}
         self._scan_all()
 

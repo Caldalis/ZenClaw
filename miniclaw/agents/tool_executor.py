@@ -13,6 +13,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from miniclaw.memory.context_guard import ContextGuard
 from miniclaw.tools.registry import ToolRegistry
 from miniclaw.types.enums import Role
@@ -26,9 +28,15 @@ logger = get_logger(__name__)
 class ToolExecutor:
     """工具调用执行器"""
 
-    def __init__(self, tool_registry: ToolRegistry, tool_result_max_bytes: int = 102400):
+    def __init__(
+        self,
+        tool_registry: ToolRegistry,
+        tool_result_max_bytes: int = 102400,
+        validation_gatekeeper: Any = None,
+    ):
         self._registry = tool_registry
         self._max_bytes = tool_result_max_bytes
+        self._gatekeeper = validation_gatekeeper
 
     async def execute(
         self,
@@ -71,6 +79,10 @@ class ToolExecutor:
                     is_error = True
                     logger.error("工具 %s 执行失败: %s", tc.name, e, exc_info=True)
 
+                # 记录验证工具结果到 Gatekeeper
+                if not is_error and self._gatekeeper and tc.name in ("run_linter", "run_tests"):
+                    self._record_validation(tc.name, result_text)
+
             # 工具输出截断（仅截断成功结果，错误信息通常较短）
             if not is_error:
                 result_text = ContextGuard.truncate_tool_result(result_text, self._max_bytes)
@@ -93,3 +105,30 @@ class ToolExecutor:
             logger.info("工具 %s 结果: %s", tc.name, result_text[:100])
 
         return messages, events
+
+    def _record_validation(self, tool_name: str, result_text: str) -> None:
+        """将验证工具的执行结果记录到 Gatekeeper"""
+        import json
+        from miniclaw.agents.critic.validation_tools import ValidationResult, ValidationStatus
+
+        try:
+            data = json.loads(result_text)
+        except json.JSONDecodeError:
+            logger.warning("验证结果 JSON 解析失败: %s", tool_name)
+            return
+
+        status_str = data.get("status", "error")
+        status = ValidationStatus.PASSED if status_str == "passed" else (
+            ValidationStatus.FAILED if status_str == "failed" else ValidationStatus.ERROR
+        )
+
+        result = ValidationResult(
+            tool_name=tool_name,
+            status=status,
+            message=data.get("message", ""),
+            errors=data.get("errors", []),
+            warnings=data.get("warnings", []),
+        )
+
+        self._gatekeeper.record_validation(tool_name, result)
+        logger.info("验证结果已记录: tool=%s, status=%s", tool_name, status.value)
