@@ -190,7 +190,14 @@ class SubagentExecutor:
             return {"finalized": False, "error": "context not found"}
 
         if ctx.result is None:
-            return {"finalized": False, "error": "no result collected"}
+            # 任务失败未收集结果 — 仍需清理 worktree 防止残留
+            if ctx.workspace:
+                try:
+                    await self._isolator.cleanup_workspace(task_id, force=True)
+                except Exception as e:
+                    logger.warning("清理失败任务的 worktree 失败: %s", e)
+            del self._contexts[task_id]
+            return {"finalized": True, "task_id": task_id, "cleaned_no_result": True}
 
         if ctx.workspace is None:
             # 没有使用 worktree，直接返回

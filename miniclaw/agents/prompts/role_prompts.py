@@ -40,8 +40,8 @@ PRESET_ROLES = {
 
 ## 可用工具
 
-- `file_reader`: 读取文件内容
-- `file_writer`: 写入文件
+- `read_file`: 读取文件内容
+- `write_file`: 写入文件
 - `terminal`: 执行命令（谨慎使用）
 
 ## 完成要求
@@ -59,7 +59,7 @@ PRESET_ROLES = {
 
 现在，请根据指令开始工作。""",
 
-        "allowed_tools": ["file_reader", "file_writer", "terminal", "calculator"],
+        "allowed_tools": ["read_file", "write_file", "edit_file", "ls", "glob", "grep", "terminal", "calculator"],
         "forbidden_tools": [],
         "requires_worktree": True,
         "max_steps": 15,
@@ -85,12 +85,12 @@ PRESET_ROLES = {
 
 ## 可用工具
 
-- `file_reader`: 读取文件内容
+- `read_file`: 读取文件内容
 - `web_search`: 网络搜索（如果可用）
 
 ## 禁止操作
 
--  使用 `file_writer` 写入文件
+-  使用 `write_file` 写入文件
 -  使用 `terminal` 执行命令
 -  修改任何代码或配置
 
@@ -109,8 +109,8 @@ PRESET_ROLES = {
 
 现在，请根据指令开始工作。""",
 
-        "allowed_tools": ["file_reader", "web_search", "calculator"],
-        "forbidden_tools": ["file_writer", "terminal"],
+        "allowed_tools": ["read_file", "grep", "glob", "web_search", "calculator"],
+            "forbidden_tools": ["write_file", "edit_file", "terminal"],
         "requires_worktree": False,
         "max_steps": 12,
         "timeout_ms": 90000,
@@ -135,7 +135,7 @@ PRESET_ROLES = {
 
 ## 可用工具
 
-- `file_reader`: 读取文件内容
+- `read_file`: 读取文件内容
 - `terminal`: 运行测试、Lint 等检查命令
 
 ## 审查维度
@@ -161,8 +161,8 @@ PRESET_ROLES = {
 
 现在，请根据指令开始审查。""",
 
-        "allowed_tools": ["file_reader", "terminal", "calculator"],
-        "forbidden_tools": ["file_writer"],
+        "allowed_tools": ["read_file", "grep", "glob", "ls", "terminal", "calculator"],
+        "forbidden_tools": ["write_file", "edit_file"],
         "requires_worktree": True,
         "max_steps": 10,
         "timeout_ms": 60000,
@@ -187,8 +187,8 @@ PRESET_ROLES = {
 
 ## 可用工具
 
-- `file_reader`: 读取源代码
-- `file_writer`: 编写测试文件
+- `read_file`: 读取源代码
+- `write_file`: 编写测试文件
 - `terminal`: 运行测试命令
 
 ## 完成要求
@@ -206,7 +206,7 @@ PRESET_ROLES = {
 
 现在，请根据指令开始编写测试。""",
 
-        "allowed_tools": ["file_reader", "file_writer", "terminal", "calculator"],
+        "allowed_tools": ["read_file", "write_file", "edit_file", "ls", "glob", "grep", "terminal", "calculator"],
         "forbidden_tools": [],
         "requires_worktree": True,
         "max_steps": 15,
@@ -266,8 +266,8 @@ PRESET_ROLES = {
 
 现在，请根据指令开始规划。""",
 
-        "allowed_tools": ["file_reader", "calculator"],
-        "forbidden_tools": ["file_writer", "terminal"],
+        "allowed_tools": ["read_file", "grep", "glob", "calculator"],
+        "forbidden_tools": ["write_file", "edit_file", "terminal"],
         "requires_worktree": False,
         "max_steps": 8,
         "timeout_ms": 60000,

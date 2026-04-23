@@ -124,9 +124,9 @@ class Settings(BaseModel):
     def model_post_init(self, __context) -> None:
         """将所有相对路径解析为项目根目录下的绝对路径"""
         self.memory.db_path = resolve_path(self.memory.db_path)
-        self.subagent.worktree_base_dir = resolve_path(self.subagent.worktree_base_dir)
-        self.skill_dirs = [resolve_path(d) for d in self.skill_dirs]
-        self.tool_dirs = [resolve_path(d) for d in self.tool_dirs]
+        # self.skill_dirs = [resolve_path(d) for d in self.skill_dirs]
+        # self.tool_dirs = [resolve_path(d) for d in self.tool_dirs]
+
 
     def is_master_subagent_mode(self) -> bool:
         """是否为 Master-Subagent 模式"""

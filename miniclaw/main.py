@@ -203,9 +203,8 @@ async def _init_tools(config: Settings, logger) -> ToolRegistry:
     """初始化技能系统"""
     # SKILL.md 文件懒加载系统
     skill_md_dirs = config.skill_dirs.copy() if config.skill_dirs else []
-    if not any(Path(d).name == "skills" for d in skill_md_dirs):
-        from miniclaw.config.settings import PROJECT_ROOT
-        skill_md_dirs.append(str(PROJECT_ROOT / "skills"))
+    from miniclaw.config.settings import PROJECT_ROOT
+    skill_md_dirs.append(str(PROJECT_ROOT / "skills"))
     skill_manager = SkillManager(skill_md_dirs)
     set_skill_manager(skill_manager)
     logger.info("SKILL.md 懒加载系统已初始化: %d 个技能", len(skill_manager.available_skills))

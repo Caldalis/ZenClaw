@@ -190,8 +190,13 @@ class CreateTaskGraphTool(Tool):
         5. 返回执行计划
         """
         try:
-            # 解析任务列表
+            # 解析任务列表 — 容错: AI 模型有时将 tasks 参数序列化为字符串而非数组
             tasks_data = kwargs.get("tasks", [])
+            if isinstance(tasks_data, str):
+                try:
+                    tasks_data = json.loads(tasks_data)
+                except json.JSONDecodeError:
+                    return "错误: tasks 参数应为 JSON 数组，但收到了无法解析的字符串"
             if not tasks_data:
                 return "错误: tasks 参数为空"
 

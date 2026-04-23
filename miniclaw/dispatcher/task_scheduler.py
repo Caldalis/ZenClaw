@@ -215,16 +215,34 @@ class TaskScheduler:
             agent_id = ctx.task_to_agent.get(task_id)
 
             if isinstance(result, Exception):
+                error_msg = str(result)
                 ctx.result.failed_tasks.append(task_id)
+                ctx.result.task_errors[task_id] = error_msg
                 ctx.failed_tasks.add(task_id)
 
                 # 更新 Dispatcher DAG 状态
                 if agent_id and dag:
-                    await self._dispatcher.fail_agent(dag, agent_id, str(result))
+                    await self._dispatcher.fail_agent(dag, agent_id, error_msg)
 
                 if ctx.request.fail_fast:
                     raise DispatcherError(
                         f"任务 {task_id} 失败: {result}",
+                        is_timeout=False,
+                    )
+            elif isinstance(result, str) and (result.startswith("错误:") or result.startswith("失败:")):
+                # 兜底: 某些路径仍可能返回错误字符串，也计入失败
+                error_msg = result
+                ctx.result.failed_tasks.append(task_id)
+                ctx.result.task_errors[task_id] = error_msg
+                ctx.failed_tasks.add(task_id)
+
+                # 更新 Dispatcher DAG 状态
+                if agent_id and dag:
+                    await self._dispatcher.fail_agent(dag, agent_id, error_msg)
+
+                if ctx.request.fail_fast:
+                    raise DispatcherError(
+                        f"任务 {task_id} 失败: {error_msg}",
                         is_timeout=False,
                     )
             else:
@@ -274,12 +292,24 @@ class TaskScheduler:
 
         # 使用 Orchestrator 执行真实 Agent（如果可用）
         if self._orchestrator is not None:
-            result = await self._execute_with_agent(ctx, task, snapshot)
+            try:
+                result = await self._execute_with_agent(ctx, task, snapshot)
+            except DispatcherError:
+                # _execute_with_agent 已抛出 DispatcherError，
+                # 但我们仍需要清理执行环境后再继续传播异常
+                is_dependency = self._is_dependency_task(task, ctx)
+                try:
+                    await self._orchestrator._subagent_executor.finalize_execution(
+                        task.id, merge_and_cleanup=not is_dependency,
+                    )
+                except Exception as cleanup_err:
+                    logger.warning("清理执行环境失败: %s", cleanup_err)
+                raise
         else:
             # 回退到模拟执行（用于测试场景）
             result = await self._simulate_execution(snapshot, task)
 
-        # 记录结果到任务节点
+        # 记录结果到任务节点（仅在成功路径到达这里时）
         task.result = result
         task.is_error = result.startswith("错误:") or result.startswith("失败:")
 
@@ -353,7 +383,7 @@ class TaskScheduler:
         if subagent_config.requires_worktree:
             if exec_ctx.workspace is None or exec_ctx.workspace.worktree_path is None:
                 logger.error("Worktree 创建失败，任务中断: %s", task.id)
-                return f"错误: Git Worktree 创建失败，无法保证文件隔离安全"
+                raise DispatcherError("Git Worktree 创建失败，无法保证文件隔离安全")
 
         # 3. 重置验证门禁器（每个子任务独立验证状态）
         orchestrator.reset_validation()
@@ -392,7 +422,7 @@ class TaskScheduler:
         task_tool_registry = ToolRegistry()
 
         # 需要替换的文件/终端工具名
-        isolated_tool_names = {"file_reader", "file_writer", "terminal"}
+        isolated_tool_names = {"read_file", "write_file", "edit_file", "ls", "glob", "grep", "terminal"}
 
         # 从 Master 工具表复制非隔离、非提交工具
         for tool in orchestrator._agent._tool_registry.list_tools():
@@ -514,7 +544,7 @@ class TaskScheduler:
                                 error_pattern=pattern,
                             )
 
-                    return f"错误: {error_msg}"
+                    raise DispatcherError(f"Agent 执行错误: {error_msg}", is_timeout=False)
 
             # Agent 未调用 submit_task_result — 用累积结果构建默认结果
             if accumulated_result:
@@ -549,18 +579,7 @@ class TaskScheduler:
                     error=str(e),
                 )
 
-            return f"错误: {str(e)}"
-        finally:
-            # 清理执行环境
-            # 如果该任务有下游依赖（其他任务的 depends_on 包含此任务），
-            # 仅提交变更保留分支，不合并/清理，使依赖任务可基于此分支创建 worktree
-            is_dependency = self._is_dependency_task(task, ctx)
-            try:
-                await orchestrator._subagent_executor.finalize_execution(
-                    task.id, merge_and_cleanup=not is_dependency,
-                )
-            except Exception as e:
-                logger.warning("清理执行环境失败: %s", e)
+            raise DispatcherError(f"Agent 执行失败: {str(e)}", is_timeout=False)
 
     async def _simulate_execution(
         self,
@@ -639,6 +658,9 @@ class TaskScheduler:
 
         之前因为有下游依赖而仅提交（未合并/清理）的 worktree，
         在这里统一执行合并到主干和清理操作。
+
+        失败任务的 worktree（未提交变更）也需要强制清理，
+        防止残留目录占用磁盘。
         """
         if self._orchestrator is None:
             return
@@ -650,8 +672,7 @@ class TaskScheduler:
                 continue
 
             workspace = ctx_obj.workspace
-            if workspace.worktree_info is None or not workspace.is_committed:
-                # 未使用 worktree 或未提交变更，跳过
+            if workspace.worktree_info is None:
                 continue
 
             if workspace.is_merged:
@@ -659,25 +680,27 @@ class TaskScheduler:
                 continue
 
             try:
-                # 合并到主干
-                merge_result = await executor._isolator._worktree_mgr.merge_to_parent(
-                    worktree_id=task_id,
-                    delete_branch=executor._isolator._auto_cleanup,
-                )
-                workspace.is_merged = merge_result.get("merged", False)
+                # 已提交的 worktree：合并到主干
+                if workspace.is_committed:
+                    merge_result = await executor._isolator._worktree_mgr.merge_to_parent(
+                        worktree_id=task_id,
+                        delete_branch=executor._isolator._auto_cleanup,
+                    )
+                    workspace.is_merged = merge_result.get("merged", False)
 
-                logger.info(
-                    "DAG worktree 已合并: task=%s, merged=%s",
-                    task_id, workspace.is_merged,
-                )
+                    logger.info(
+                        "DAG worktree 已合并: task=%s, merged=%s",
+                        task_id, workspace.is_merged,
+                    )
 
-                # 清理 worktree
+                # 清理 worktree（无论是否合并、无论是否提交）
                 if executor._isolator._auto_cleanup:
                     await executor._isolator._worktree_mgr.remove_worktree(
                         worktree_id=task_id,
                         force=True,
                     )
                     workspace.is_active = False
+                    logger.info("DAG worktree 已清理: task=%s", task_id)
 
             except Exception as e:
                 logger.warning("DAG worktree 合并/清理失败: task=%s, error=%s", task_id, e)

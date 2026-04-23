@@ -240,7 +240,8 @@ class MasterAgent:
         if result.failed_tasks:
             lines.append("### 失败任务")
             for task_id in result.failed_tasks:
-                lines.append(f"- {task_id}")
+                error_detail = result.task_errors.get(task_id, "未知错误")
+                lines.append(f"- {task_id}: {error_detail}")
             lines.append("")
 
         lines.append("请根据以上结果决定下一步行动：")

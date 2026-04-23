@@ -185,7 +185,7 @@ class SubagentRegistry:
             timeout_ms=self.guardrails.default_timeout_ms,
             requires_worktree=True,
             worktree_prefix="feature/",
-            allowed_tools=["file_reader", "file_writer", "terminal"],
+            allowed_tools=["read_file", "write_file", "edit_file", "ls", "glob", "grep", "terminal"],
         ))
 
         # Searcher
@@ -197,8 +197,8 @@ class SubagentRegistry:
             max_steps=self.guardrails.default_max_steps,
             timeout_ms=90000,  # 搜索任务通常较快
             requires_worktree=False,
-            allowed_tools=["web_search", "file_reader"],
-            forbidden_tools=["file_writer", "terminal"],  # 搜索者不应修改文件
+            allowed_tools=["web_search", "read_file", "grep", "glob"],
+            forbidden_tools=["write_file", "edit_file", "terminal"],  # 搜索者不应修改文件
         ))
 
         # Reviewer
@@ -211,8 +211,8 @@ class SubagentRegistry:
             timeout_ms=60000,
             requires_worktree=True,
             worktree_prefix="review/",
-            allowed_tools=["file_reader"],
-            forbidden_tools=["file_writer", "terminal"],  # 审查者不应修改文件
+            allowed_tools=["read_file", "grep", "glob", "ls"],
+            forbidden_tools=["write_file", "edit_file", "terminal"],  # 审查者不应修改文件
         ))
 
         # Tester
@@ -225,7 +225,7 @@ class SubagentRegistry:
             timeout_ms=180000,  # 测试可能需要较长时间
             requires_worktree=True,
             worktree_prefix="test/",
-            allowed_tools=["file_reader", "file_writer", "terminal"],
+            allowed_tools=["read_file", "write_file", "edit_file", "ls", "glob", "grep", "terminal"],
         ))
 
         # Planner

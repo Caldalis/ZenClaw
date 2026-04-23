@@ -146,6 +146,9 @@ class TaskGraphResult(BaseModel):
     failed_tasks: list[str] = Field(default_factory=list)
     """失败的任务 ID"""
 
+    task_errors: dict[str, str] = Field(default_factory=dict)
+    """失败任务的错误详情 (task_id -> error_message)"""
+
     @property
     def is_complete(self) -> bool:
         """任务图是否全部完成"""
