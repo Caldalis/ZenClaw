@@ -37,18 +37,86 @@ from miniclaw.utils.logging import get_logger
 logger = get_logger(__name__)
 
 
-# 全局任务图存储（用于调度器访问）
-_pending_graphs: dict[str, TaskGraphRequest] = {}
+class PendingGraphStore:
+    """待执行任务图的存储抽象
+
+    历史上 create_task_graph 用一个模块级 dict 存 request，调度器通过
+    get_pending_graph 取走。问题：
+      - 进程级单例 → 多个 Orchestrator 会互相串数据
+      - clear 从来没被调用 → dict 只增不减，长期运行内存泄漏
+
+    这里抽成显式对象。每个 Orchestrator 创建自己的 store 并绑定到
+    CreateTaskGraphTool 实例。DAG 执行完后调度器显式 pop。
+    """
+
+    def __init__(self) -> None:
+        self._store: dict[str, TaskGraphRequest] = {}
+
+    def put(self, graph_id: str, request: TaskGraphRequest) -> None:
+        self._store[graph_id] = request
+
+    def get(self, graph_id: str) -> TaskGraphRequest | None:
+        return self._store.get(graph_id)
+
+    def pop(self, graph_id: str) -> TaskGraphRequest | None:
+        return self._store.pop(graph_id, None)
+
+    def __contains__(self, graph_id: str) -> bool:
+        return graph_id in self._store
+
+    def __len__(self) -> int:
+        return len(self._store)
+
+
+# 兼容遗留调用：未显式绑定的 CreateTaskGraphTool 会落到这个默认 store。
+# 新代码应该走 Orchestrator 注入的独立 store。
+_default_store = PendingGraphStore()
 
 
 def get_pending_graph(graph_id: str) -> TaskGraphRequest | None:
-    """获取待执行的任务图"""
-    return _pending_graphs.get(graph_id)
+    """[兼容 API] 获取默认 store 的 request"""
+    return _default_store.get(graph_id)
 
 
 def clear_pending_graph(graph_id: str) -> None:
-    """清除已执行的任务图"""
-    _pending_graphs.pop(graph_id, None)
+    """[兼容 API] 清除默认 store 的 request"""
+    _default_store.pop(graph_id)
+
+
+def _coerce_list_field(value: Any, field_name: str) -> list:
+    """将 AI 可能序列化成字符串的 list 字段解析回 list。"""
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return []
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError:
+            logger.warning("%s 无法解析为 JSON 列表: %r，已按空列表处理", field_name, value)
+            return []
+        return parsed if isinstance(parsed, list) else [parsed]
+    if value is None:
+        return []
+    return [value]
+
+
+def _coerce_dict_field(value: Any, field_name: str) -> dict:
+    """将 AI 可能序列化成字符串的 dict 字段解析回 dict。"""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return {}
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError:
+            logger.warning("%s 无法解析为 JSON 对象: %r，已按空对象处理", field_name, value)
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
 
 
 class CreateTaskGraphTool(Tool):
@@ -56,6 +124,13 @@ class CreateTaskGraphTool(Tool):
 
     当任务过大时，Master Agent 使用此工具割裂上下文，将复杂任务分解为可并行执行的 DAG。
     """
+
+    def __init__(self, store: PendingGraphStore | None = None) -> None:
+        self._store: PendingGraphStore = store if store is not None else _default_store
+
+    def bind_store(self, store: PendingGraphStore) -> None:
+        """把工具重新绑定到指定 store（Orchestrator 初始化时调用）"""
+        self._store = store
 
     @property
     def name(self) -> str:
@@ -202,13 +277,21 @@ class CreateTaskGraphTool(Tool):
 
             tasks = []
             for task_data in tasks_data:
+
+                depends_on = _coerce_list_field(
+                    task_data.get("depends_on", []), field_name="depends_on"
+                )
+                custom_role_config = _coerce_dict_field(
+                    task_data.get("custom_role_config", {}), field_name="custom_role_config"
+                )
+
                 task = TaskNode(
                     id=task_data.get("id", f"task_{len(tasks)}"),
                     role=task_data.get("role", "GenericAgent"),
                     instruction=task_data.get("instruction", ""),
-                    depends_on=task_data.get("depends_on", []),
+                    depends_on=depends_on,
                     custom_role_prompt=task_data.get("custom_role_prompt"),
-                    custom_role_config=task_data.get("custom_role_config", {}),
+                    custom_role_config=custom_role_config,
                     priority=task_data.get("priority", 0),
                 )
                 tasks.append(task)
@@ -237,7 +320,7 @@ class CreateTaskGraphTool(Tool):
             result = build_task_graph_result(request)
 
             # 存储待执行的任务图（供调度器使用）
-            _pending_graphs[result.graph_id] = request
+            self._store.put(result.graph_id, request)
 
             logger.info(
                 "任务图已创建: %s (%d 任务, %d 层级)",

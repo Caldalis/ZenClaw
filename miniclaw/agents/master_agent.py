@@ -106,19 +106,44 @@ class MasterAgent:
                 # 运行 Agent — 它可能创建 task_graph 或直接回复
                 graph_id = None
                 has_task_graph = False
+                pending_tool_name: str | None = None
 
-                async for event in self._agent.process_message(current_message, session_id):
-                    # 检测 create_task_graph 调用
-                    if event.event_type.value == "tool_call_start":
-                        if event.data.get("name") == "create_task_graph":
-                            has_task_graph = True
-                            logger.info("检测到 create_task_graph 调用 (round %d)", round_num)
+                # 关键: 拿到 graph_id 立刻打断内层 ReAct 循环。
+                # 否则内层 agent 看到 create_task_graph 只返回一个计划 ack
+                # （还没有实际执行结果），会以为"啥都没发生"而连续重复调用，
+                # 直到撞上自己的 max_iterations 才停 — 形成可观测的"狂刷 DAG"
+                # 死循环。我们要在外层接管：拿到 graph_id 就 break，去 _wait_for_graph_result
+                # 跑真正的执行，再把结果喂回下一轮。
+                event_iter = self._agent.process_message(current_message, session_id)
+                try:
+                    async for event in event_iter:
+                        ev_type = event.event_type.value
 
-                    if event.event_type.value == "tool_call_result":
-                        result_str = event.data.get("result", "")
-                        graph_id = self._extract_graph_id(result_str)
+                        if ev_type == "tool_call_start":
+                            pending_tool_name = event.data.get("name")
+                            if pending_tool_name == "create_task_graph":
+                                has_task_graph = True
+                                logger.info(
+                                    "检测到 create_task_graph 调用 (round %d)", round_num,
+                                )
 
-                    yield event
+                        if ev_type == "tool_call_result":
+                            tool_name = event.data.get("name") or pending_tool_name
+                            if tool_name == "create_task_graph":
+                                result_str = event.data.get("result", "")
+                                gid = self._extract_graph_id(result_str)
+                                if gid:
+                                    graph_id = gid
+                            pending_tool_name = None
+
+                        yield event
+
+                        # 拿到有效 graph_id → 立即跳出，交给 _wait_for_graph_result
+                        if has_task_graph and graph_id:
+                            break
+                finally:
+                    # 显式关闭异步生成器，触发其内部 finally/cleanup
+                    await event_iter.aclose()
 
                 # Agent 未创建任务图 → 直接回复 → 结束
                 if not has_task_graph or not graph_id:
@@ -143,8 +168,26 @@ class MasterAgent:
                     "如果存在未解决的问题，请在总结中说明。"
                 )
                 summary_message = Message(role=Role.USER, content=summary_prompt)
-                async for event in self._agent.process_message(summary_message, session_id):
-                    yield event
+                # 防御层: summary 轮明确禁止建图，但 LLM 可能不听话。
+                # 一旦它仍然尝试 create_task_graph，立即吞掉该次调用并打断
+                # 内层循环 — 拒绝执行图、避免重新进入"狂刷 DAG"状态。
+                summary_iter = self._agent.process_message(summary_message, session_id)
+                try:
+                    async for event in summary_iter:
+                        ev_type = event.event_type.value
+                        if (ev_type == "tool_call_start"
+                                and event.data.get("name") == "create_task_graph"):
+                            logger.warning(
+                                "Summary 轮违规调用 create_task_graph，已忽略并提前终止"
+                            )
+                            yield Event.text_done(
+                                "(系统) 已达到最大任务图轮数，本轮拒绝再创建任务图。",
+                                session_id,
+                            )
+                            break
+                        yield event
+                finally:
+                    await summary_iter.aclose()
 
         except CircuitBreakerError as e:
             logger.error("熔断触发: %s", e)
@@ -180,10 +223,12 @@ class MasterAgent:
 
         通过 Orchestrator 调度执行子任务图，并等待结果返回。
         """
-        from miniclaw.tools.builtin.create_task_graph import get_pending_graph
-
-        # 获取任务图请求
-        request = get_pending_graph(graph_id)
+        # 优先从 Orchestrator 的私有 store 取 request，回退到模块级默认 store
+        # 以保证尚未升级的调用路径仍能工作
+        request = self._orchestrator.pending_graph_store.get(graph_id)
+        if request is None:
+            from miniclaw.tools.builtin.create_task_graph import get_pending_graph
+            request = get_pending_graph(graph_id)
         if request is None:
             logger.warning("任务图请求不存在: %s", graph_id)
             return None
@@ -193,6 +238,8 @@ class MasterAgent:
                 request, master_node, timeout_seconds=timeout_seconds,
                 graph_id=graph_id,
             )
+            # DAG 执行完后显式清理 store，避免长期积压
+            self._orchestrator.pending_graph_store.pop(graph_id)
 
             logger.info(
                 "任务图 %s 执行完成: status=%s, completed=%d, failed=%d",
@@ -219,7 +266,11 @@ class MasterAgent:
     def _build_result_message(self, result: TaskGraphResult) -> Message:
         """构建结果消息（注入回对话供 Agent 决策）
 
-        合入了 Orchestrator 的格式化逻辑，展示任务完成/失败详情。
+        失败任务会被显式标红，并要求 Master 必须二选一：
+          A. 创建新 task_graph 重试
+          B. 在最终回复里如实告知用户"<用户要的东西> 没做出来"
+
+        禁止 Master 自己直接写代码（这是 Master Agent 的硬约束）。
         """
         lines = [
             "## 任务图执行结果",
@@ -243,11 +294,17 @@ class MasterAgent:
                 error_detail = result.task_errors.get(task_id, "未知错误")
                 lines.append(f"- {task_id}: {error_detail}")
             lines.append("")
-
-        lines.append("请根据以上结果决定下一步行动：")
-        lines.append("- 如果所有任务成功，直接总结最终结果")
-        lines.append("- 如果部分任务失败，可以创建新的任务图来处理失败部分")
-        lines.append("- 如果问题无法通过任务图解决，直接说明情况")
+            lines.append("### ⚠️ 你必须二选一")
+            lines.append("1. **重试**: 调用 `create_task_graph` 重新派发**失败任务**（可调整 instruction、换角色、缩小范围）。")
+            lines.append("2. **如实汇报**: 如果判断无法重试，直接告诉用户"
+                         "「<原始任务> 没有完成，原因是 ...」并停止——")
+            lines.append("   **不要**自己 `write_file` 写代码，**不要**改换主题去做别的任务，"
+                         "**不要**把别的产物当成功汇报。")
+        else:
+            lines.append("### 下一步")
+            lines.append("所有任务成功 → 总结最终结果交付给用户。")
+            lines.append("**不要**创建新的任务图（任务已完成）。")
+            lines.append("**不要**自己写代码或修改文件。")
 
         return Message(
             role=Role.USER,

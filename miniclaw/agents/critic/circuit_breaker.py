@@ -229,6 +229,51 @@ class CircuitBreaker:
 
         return updated_pattern
 
+    def record_tool_failure(
+        self,
+        tool_name: str,
+        status: str,
+        message: str = "",
+    ) -> ErrorPattern:
+        """记录"工具结构化失败"
+
+        与 record_failure 不同，结构化失败不是抛出的异常，而是工具返回的
+        status=error/failed 这种结果。日志里典型场景：run_linter 反复返回
+        "未找到可用的 linter"——agent 看到 ERROR 结果后会反复重试，但因为没
+        有抛异常，老的 record_failure 路径捕捉不到，熔断器永远不动。
+
+        这里给这类失败合成一个 ErrorPattern（指纹由 tool+status+message 决定），
+        走和 record_failure 相同的累计/熔断路径。
+        """
+        if self._last_failure_time:
+            elapsed = (datetime.now(timezone.utc) - self._last_failure_time).total_seconds()
+            if elapsed > self.config.time_window_seconds:
+                self._reset_counts()
+
+        self._last_failure_time = datetime.now(timezone.utc)
+        self._failure_count += 1
+
+        pattern = ErrorPattern(
+            error_type=f"ToolResult:{tool_name}:{status}",
+            error_message=(message or "")[:200],
+            location=None,
+        )
+
+        if pattern.fingerprint in self._error_patterns:
+            self._error_patterns[pattern.fingerprint].increment()
+        else:
+            self._error_patterns[pattern.fingerprint] = pattern
+
+        updated = self._error_patterns[pattern.fingerprint]
+        if self._should_trip(updated):
+            self._trip(updated)
+
+        logger.warning(
+            "熔断器记录工具失败: tool=%s, status=%s, count=%d, is_open=%s",
+            tool_name, status, updated.count, self.is_open,
+        )
+        return updated
+
     def _extract_error_pattern(self, error: Exception) -> ErrorPattern:
         """从错误中提取模式"""
         error_type = type(error).__name__

@@ -34,6 +34,12 @@ class Session(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
+    # 会话类型："user" 表示终端用户/Master 会话，"subagent" 表示派生子任务会话
+    kind: str = "user"
+
+    # 派生会话指向的父会话 id（subagent 使用，便于按父归组清理）
+    parent_session_id: str | None = None
+
     def add_message(self, message: Message) -> None:
         """添加消息并更新时间戳"""
         message.session_id = self.id

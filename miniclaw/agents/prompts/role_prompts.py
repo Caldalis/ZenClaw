@@ -42,7 +42,22 @@ PRESET_ROLES = {
 
 - `read_file`: 读取文件内容
 - `write_file`: 写入文件
-- `terminal`: 执行命令（谨慎使用）
+- `edit_file`, `ls`, `glob`, `grep`, `terminal`: 标准编辑/检索/执行工具
+- `run_linter`: 运行代码检查（验证工具）
+- `run_tests`: 运行测试套件（验证工具）
+
+## 提交前必做（验证闭环）
+
+代码写完后，**必须**先调用至少一个验证工具，再调用 `submit_task_result`：
+1. 优先调 `run_linter` 检查语法/风格；如果环境未装 linter（status=`error`），系统会自动豁免，**不要**因此停在原地反复重试
+2. 如果任务里要求测试或包内已有测试文件，再调 `run_tests`
+3. 验证记录到位后再 `submit_task_result`，否则会被门禁拦截
+
+## 角色边界
+
+- 你**只负责实现**，不要主动写测试文件、不要替 TesterAgent 跑全量测试
+- 如果当前任务确实没有可跑的测试，直接调 `run_linter`（即使 ERROR 也算尝试过）后即可提交
+- 写完代码立刻交付，不要因为门禁拒绝就开始扩大范围
 
 ## 完成要求
 
@@ -62,8 +77,9 @@ PRESET_ROLES = {
         "allowed_tools": ["read_file", "write_file", "edit_file", "ls", "glob", "grep", "terminal", "calculator"],
         "forbidden_tools": [],
         "requires_worktree": True,
-        "max_steps": 15,
-        "timeout_ms": 120000,
+        "requires_validation": True,
+        "max_steps": 25,
+        "timeout_ms": 180000,
     },
 
     "SearcherAgent": {
@@ -112,6 +128,7 @@ PRESET_ROLES = {
         "allowed_tools": ["read_file", "grep", "glob", "web_search", "calculator"],
             "forbidden_tools": ["write_file", "edit_file", "terminal"],
         "requires_worktree": False,
+        "requires_validation": False,
         "max_steps": 12,
         "timeout_ms": 90000,
     },
@@ -121,51 +138,57 @@ PRESET_ROLES = {
 
 ## 核心职责
 
-1. **代码审查**：检查代码的正确性、安全性、可维护性
-2. **质量检查**：运行 Lint、类型检查等质量工具
-3. **问题发现**：识别潜在的 Bug、安全漏洞、性能问题
-4. **改进建议**：提供具体的改进建议
+1. **代码审查**：基于已读到的源代码评估正确性、安全性、可维护性
+2. **问题发现**：识别潜在的 Bug、安全漏洞、性能问题
+3. **改进建议**：提供具体可行的修改建议
 
 ## 工作原则
 
-- **只读审查**：你不应修改代码，只提出建议
+- **只读审查**：你不能修改代码，也不会被允许调用 write_file/edit_file/terminal
 - **客观公正**：基于最佳实践和规范进行评价
-- **具体可行**：提供具体的问题位置和修改建议
-- **分级标注**：区分严重程度（Critical/Major/Minor）
+- **分级标注**：区分严重程度（Critical / Major / Minor）
 
 ## 可用工具
 
-- `read_file`: 读取文件内容
-- `terminal`: 运行测试、Lint 等检查命令
+- `read_file` / `glob` / `grep` / `ls`: 阅读和导航源代码
+- 你**没有** `run_linter` / `run_tests` / `terminal` 工具 — 不要尝试调用它们
+
+## 审查流程（严格按此执行）
+
+1. 用 `read_file` 通读需要审查的文件
+2. 在心里完成审查，把发现整理成结构化清单
+3. **直接** `submit_task_result` 输出审查报告 — 你**不需要**也**不应该**运行任何验证工具
+4. 不要尝试自己装 linter、不要 pip install、不要重复读同一个文件
 
 ## 审查维度
 
-- **正确性**：逻辑是否正确，是否有边界情况遗漏
-- **安全性**：是否存在注入、XSS、敏感信息泄露等风险
-- **性能**：是否有性能问题（N+1 查询、内存泄漏等）
-- **可维护性**：代码是否清晰，命名是否合理
+- **正确性**：逻辑、边界情况、错误处理
+- **安全性**：注入、XSS、敏感信息泄露
+- **性能**：N+1 查询、内存泄漏、不必要的循环
+- **可维护性**：命名、结构、注释
 - **测试覆盖**：是否有足够的测试
 
 ## 完成要求
 
-完成任务后，必须调用 `submit_task_result` 工具提交结果。
+完成审查后，**立即**调用 `submit_task_result`，把审查结论放在 `summary` / `unresolved_issues` 字段里：
 
 ```json
 {
     "status": "success | partial_success | failed",
     "files_changed": [],
-    "summary": "审查结果摘要",
-    "unresolved_issues": "发现的问题列表"
+    "summary": "审查结果摘要（50-200 字）",
+    "unresolved_issues": "发现的具体问题清单"
 }
 ```
 
 现在，请根据指令开始审查。""",
 
-        "allowed_tools": ["read_file", "grep", "glob", "ls", "terminal", "calculator"],
-        "forbidden_tools": ["write_file", "edit_file"],
+        "allowed_tools": ["read_file", "grep", "glob", "ls", "calculator"],
+        "forbidden_tools": ["write_file", "edit_file", "terminal"],
         "requires_worktree": True,
-        "max_steps": 10,
-        "timeout_ms": 60000,
+        "requires_validation": False,
+        "max_steps": 20,
+        "timeout_ms": 120000,
     },
 
     "TesterAgent": {
@@ -188,8 +211,16 @@ PRESET_ROLES = {
 ## 可用工具
 
 - `read_file`: 读取源代码
-- `write_file`: 编写测试文件
+- `write_file`, `edit_file`: 编写/编辑测试文件
 - `terminal`: 运行测试命令
+- `run_tests`: 验证工具（提交前必跑）
+- `run_linter`: 验证工具（可选）
+
+## 提交前必做（验证闭环）
+
+写完测试后**必须**先 `run_tests`（指定 `test_files` 列表为你新建的测试文件），通过后再 `submit_task_result`，否则提交会被拦截。
+
+如果环境中 pytest/jest 不可用（status=`error`），系统会自动豁免，**不要**因此停在原地反复换运行器或试图安装。把这种情况在 `unresolved_issues` 里写明即可提交。
 
 ## 完成要求
 
@@ -209,8 +240,9 @@ PRESET_ROLES = {
         "allowed_tools": ["read_file", "write_file", "edit_file", "ls", "glob", "grep", "terminal", "calculator"],
         "forbidden_tools": [],
         "requires_worktree": True,
-        "max_steps": 15,
-        "timeout_ms": 180000,
+        "requires_validation": True,
+        "max_steps": 25,
+        "timeout_ms": 240000,
     },
 
     "PlannerAgent": {
@@ -269,8 +301,9 @@ PRESET_ROLES = {
         "allowed_tools": ["read_file", "grep", "glob", "calculator"],
         "forbidden_tools": ["write_file", "edit_file", "terminal"],
         "requires_worktree": False,
-        "max_steps": 8,
-        "timeout_ms": 60000,
+        "requires_validation": False,
+        "max_steps": 12,
+        "timeout_ms": 90000,
     },
 
     "GenericAgent": {
@@ -298,6 +331,7 @@ PRESET_ROLES = {
         "allowed_tools": [],  # 空表示允许所有
         "forbidden_tools": [],
         "requires_worktree": False,
+        "requires_validation": False,
         "max_steps": 15,
         "timeout_ms": 120000,
     },

@@ -62,11 +62,25 @@ class Agent:
         self._session_mgr = session_manager
         self._memory = memory_store
 
+        # 本 Agent 局部的工具失败熔断器：检测"同一个工具反复返回结构化失败"
+        # 的死循环（比如 run_linter 连续 N 次报 ERROR）。这是一个独立于
+        # Orchestrator 级 CircuitBreaker 的"工具级"熔断，跨任务自动隔离
+        # （每个 subagent 是新 Agent 实例，breaker 跟着重建）。
+        from miniclaw.agents.critic.circuit_breaker import (
+            CircuitBreaker,
+            CircuitBreakerConfig,
+        )
+        self._tool_breaker = CircuitBreaker(CircuitBreakerConfig(
+            failure_threshold=5,
+            same_error_threshold=3,
+        ))
+
         mem_cfg = memory_config or MemoryConfig()
         self._tool_executor = ToolExecutor(
             tool_registry,
             tool_result_max_bytes=mem_cfg.tool_result_max_bytes,
             validation_gatekeeper=validation_gatekeeper,
+            tool_circuit_breaker=self._tool_breaker,
         )
         self._context_window = ContextWindow(config.max_context_tokens)
         self._context_guard = ContextGuard(
@@ -74,6 +88,31 @@ class Agent:
             compaction_threshold=config.compaction_threshold,
         )
         self._compaction_keep_recent = config.compaction_keep_recent
+
+    @property
+    def tool_registry(self) -> ToolRegistry:
+        """返回 Agent 绑定的工具注册表（只读引用）。"""
+        return self._tools
+
+    @property
+    def provider_registry(self) -> ProviderRegistry:
+        """返回 Agent 绑定的 Provider 注册表（只读引用）。"""
+        return self._providers
+
+    @property
+    def session_manager(self) -> SessionManager:
+        """返回 Agent 绑定的会话管理器（只读引用）。"""
+        return self._session_mgr
+
+    @property
+    def memory_store(self) -> MemoryStore:
+        """返回 Agent 绑定的记忆存储（只读引用）。"""
+        return self._memory
+
+    @property
+    def config(self) -> AgentConfig:
+        """返回 Agent 的配置对象（只读引用）。"""
+        return self._config
 
     async def process_message(self, user_message: Message, session_id: str) -> AsyncIterator[Event]:
         """处理用户消息 — Agent 的核心入口
@@ -152,6 +191,14 @@ class Agent:
                 # 保存工具结果
                 for msg in tool_messages:
                     await self._session_mgr.add_message(session_id, msg)
+                # 工具熔断检查：同一个工具反复返回结构化失败时立即终止，
+                # 不要让 agent 继续浪费迭代和上下文。
+                if self._tool_breaker.is_open:
+                    breaker_err = self._tool_breaker.get_breaker_error()
+                    logger.warning("工具熔断器已跳闸: %s", breaker_err)
+                    yield Event.error(f"工具熔断: {breaker_err}", session_id)
+                    yield Event.done(session_id)
+                    return
                 # 继续循环: AI 需要看到工具结果后再回复
                 continue
             else:
@@ -204,17 +251,23 @@ class Agent:
 
             # 流式调用 AI
             try:
-                ai_message = None
                 provider = self._providers.get_provider()
                 raw_stream = provider.chat_stream(context, tool_schemas)
 
-                async for event in process_stream(raw_stream, session_id):
+                # 通过 sink 拿回 done 事件里的完整 Message，避免再发一次
+                # 非流式请求（这会导致每轮 token 成本翻倍）
+                message_sink: list[Message] = []
+                async for event in process_stream(
+                    raw_stream, session_id, sink=message_sink,
+                ):
                     yield event
 
-                # 获取完整消息（从 process_stream 的 done 事件）
-                # 需要重新获取，因为 process_stream 是 generator
-                # 改为直接调用 provider 获取完整消息
-                ai_message = await self._call_ai_with_failover(context, tool_schemas)
+                if message_sink:
+                    ai_message = message_sink[-1]
+                else:
+                    # Provider 未产出 done 事件时退化为一次性请求
+                    logger.warning("流式响应未产出完整 Message，退化为非流式请求")
+                    ai_message = await self._call_ai_with_failover(context, tool_schemas)
 
             except ProviderError as e:
                 yield Event.error(f"AI 调用失败: {e}", session_id)
@@ -228,7 +281,6 @@ class Agent:
             if session and self._context_guard.should_compact(session.messages):
                 logger.info("上下文接近上限，开始自动压缩...")
                 await self._compact_messages(session_id, session.messages)
-
             if ai_message.is_tool_call():
                 tool_messages, tool_events = await self._tool_executor.execute(
                     ai_message.tool_calls, session_id
@@ -237,6 +289,12 @@ class Agent:
                     yield event
                 for msg in tool_messages:
                     await self._session_mgr.add_message(session_id, msg)
+                if self._tool_breaker.is_open:
+                    breaker_err = self._tool_breaker.get_breaker_error()
+                    logger.warning("工具熔断器已跳闸: %s", breaker_err)
+                    yield Event.error(f"工具熔断: {breaker_err}", session_id)
+                    yield Event.done(session_id)
+                    return
                 continue
             else:
                 yield Event.done(session_id)

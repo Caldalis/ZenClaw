@@ -140,6 +140,13 @@ class SubagentSpec:
     worktree_prefix: str = ""
     """Worktree 目录前缀（如 'feature/', 'fix/'）"""
 
+    # 验证门禁
+    # 审查/搜索/规划类角色不产出代码（forbidden 包含 write_file/edit_file），
+    # 强制 run_linter/run_tests 验证毫无意义且会让它们陷入死循环（反复试 linter）。
+    # 默认 True（产出代码的 coder/tester），False 用于只读角色。
+    requires_validation: bool = True
+    """提交结果前是否需要至少一次成功的 linter/tests 验证"""
+
 
 class SubagentRegistry:
     """Subagent 注册表
@@ -199,6 +206,7 @@ class SubagentRegistry:
             requires_worktree=False,
             allowed_tools=["web_search", "read_file", "grep", "glob"],
             forbidden_tools=["write_file", "edit_file", "terminal"],  # 搜索者不应修改文件
+            requires_validation=False,
         ))
 
         # Reviewer
@@ -207,12 +215,13 @@ class SubagentRegistry:
             name="Reviewer Agent",
             description="代码审查执行者，负责质量检查",
             system_prompt="你是 Reviewer Agent，专注于代码审查和质量检查。检查代码的正确性、安全性、可维护性，返回审查报告。",
-            max_steps=10,  # 审查任务步数较少
-            timeout_ms=60000,
+            max_steps=20,
+            timeout_ms=120000,
             requires_worktree=True,
             worktree_prefix="review/",
             allowed_tools=["read_file", "grep", "glob", "ls"],
             forbidden_tools=["write_file", "edit_file", "terminal"],  # 审查者不应修改文件
+            requires_validation=False,
         ))
 
         # Tester
@@ -222,7 +231,7 @@ class SubagentRegistry:
             description="测试执行者，负责编写和运行测试",
             system_prompt="你是 Tester Agent，专注于测试编写和执行。根据需求编写测试用例，运行测试并返回结果报告。",
             max_steps=self.guardrails.default_max_steps,
-            timeout_ms=180000,  # 测试可能需要较长时间
+            timeout_ms=180000,
             requires_worktree=True,
             worktree_prefix="test/",
             allowed_tools=["read_file", "write_file", "edit_file", "ls", "glob", "grep", "terminal"],
@@ -234,9 +243,10 @@ class SubagentRegistry:
             name="Planner Agent",
             description="规划执行者，负责详细任务规划",
             system_prompt="你是 Planner Agent，专注于任务规划。将模糊的任务需求转化为清晰的执行计划，输出结构化的步骤列表。",
-            max_steps=8,
-            timeout_ms=60000,
+            max_steps=12,
+            timeout_ms=90000,
             requires_worktree=False,
+            requires_validation=False,
         ))
 
         # Generic

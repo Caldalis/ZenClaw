@@ -212,34 +212,42 @@ class ValidationGatekeeper:
             if r.timestamp.timestamp() >= cutoff
         ]
 
+    # 视为"已尝试且无阻碍"的状态：
+    #   - PASSED: 工具通过
+    #   - ERROR : 工具本身不可用（如未安装 ruff），不应阻止任务交付
+    # 这避免了"环境缺 linter → submit 永远被拦"的死锁。
+    _ACCEPTABLE_STATUSES = (ValidationStatus.PASSED, ValidationStatus.ERROR)
+
     def _has_passed_validation(self, records: list[ValidationRecord]) -> bool:
-        """是否有通过验证的记录"""
-        return any(r.status == ValidationStatus.PASSED for r in records)
+        """是否有可接受的验证记录（通过 或 工具不可用）"""
+        return any(r.status in self._ACCEPTABLE_STATUSES for r in records)
 
     def _has_passed_linter(self, records: list[ValidationRecord]) -> bool:
-        """是否有通过 linter 的记录"""
+        """是否有 linter 记录（通过 或 工具不可用）"""
         return any(
-            r.status == ValidationStatus.PASSED and "linter" in r.tool_name
+            r.status in self._ACCEPTABLE_STATUSES and "linter" in r.tool_name
             for r in records
         )
 
     def _has_passed_tests(self, records: list[ValidationRecord]) -> bool:
-        """是否有通过测试的记录"""
+        """是否有测试记录（通过 或 工具不可用）"""
         return any(
-            r.status == ValidationStatus.PASSED and "test" in r.tool_name
+            r.status in self._ACCEPTABLE_STATUSES and "test" in r.tool_name
             for r in records
         )
 
     def _get_validation_required_message(self) -> str:
         """获取验证要求消息"""
         if self.config.requirement == ValidationRequirement.ANY:
-            return """**验证要求**: 在调用 submit_task_result 前，必须先运行 `run_linter` 或 `run_tests` 并确保通过。
+            return """**验证要求**: 在调用 submit_task_result 前，必须先运行 `run_linter` 或 `run_tests` 至少一次。
 
 请执行以下操作之一:
 1. 调用 `run_linter` 检查代码质量
 2. 调用 `run_tests` 运行测试
 
-如果有充分的理由无法验证，请在 submit_task_result 的 unresolved_issues 中说明原因。"""
+注意：如果工具返回 `status=error`（如 "未找到可用的 linter"、"pytest 未安装"），
+**等价于已经尝试过验证**，可以直接调用 submit_task_result，不要反复重试不同的 linter/runner。
+把环境问题写在 unresolved_issues 字段即可。"""
 
         elif self.config.requirement == ValidationRequirement.LINTER:
             return "**验证要求**: 在调用 submit_task_result 前，必须先运行 `run_linter` 并确保通过。"
@@ -255,12 +263,29 @@ class ValidationGatekeeper:
         return "需要验证"
 
     def _get_validation_failed_message(self) -> str:
-        """获取验证失败消息"""
-        return """**验证未通过**: 你的代码验证失败，请修复问题后重新验证。
+        """获取验证失败消息
 
-1. 根据错误信息修复代码
-2. 重新运行验证工具
-3. 验证通过后再调用 submit_task_result"""
+        到这里说明已经有验证记录但都不是 PASSED/ERROR — 即至少有一次 FAILED。
+        """
+        last_failed = next(
+            (r for r in reversed(self._validation_records)
+             if r.status == ValidationStatus.FAILED),
+            None,
+        )
+        detail = ""
+        if last_failed is not None:
+            detail = (
+                f"\n\n最近一次失败: tool={last_failed.tool_name}, "
+                f"errors={last_failed.details.get('error_count', 0)}, "
+                f"message={last_failed.details.get('message', '')[:120]}"
+            )
+        return (
+            "**验证未通过**: 你的代码验证失败，请修复问题后重新验证。\n\n"
+            "1. 根据错误信息修复代码\n"
+            "2. 重新运行验证工具\n"
+            "3. 验证通过后再调用 submit_task_result"
+            + detail
+        )
 
     def get_status(self) -> dict[str, Any]:
         """获取状态"""

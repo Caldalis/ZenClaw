@@ -156,11 +156,12 @@ class WorkspaceIsolator:
                 )
 
             except Exception as e:
-                logger.warning("创建 worktree 失败，降级为非隔离模式: %s", e)
-                workspace.worktree_path = self._worktree_mgr.repo_root
-                workspace.is_active = True
 
-
+                logger.error(
+                    "创建 worktree 失败（requires_worktree=True，不降级）: id=%s, error=%s",
+                    workspace_id, e,
+                )
+                workspace.is_active = False
 
         else:
             # 不需要 worktree，使用仓库根目录

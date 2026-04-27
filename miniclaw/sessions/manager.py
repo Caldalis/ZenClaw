@@ -43,23 +43,43 @@ class SessionManager:
                 title TEXT DEFAULT '',
                 status TEXT DEFAULT 'active',
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                kind TEXT DEFAULT 'user',
+                parent_session_id TEXT
             )
         """)
+        # 兼容老库：如果旧版 schema 没有 kind / parent_session_id 列，补上
+        cursor = await self._meta_db.execute("PRAGMA table_info(sessions)")
+        cols = {row[1] for row in await cursor.fetchall()}
+        if "kind" not in cols:
+            await self._meta_db.execute(
+                "ALTER TABLE sessions ADD COLUMN kind TEXT DEFAULT 'user'"
+            )
+        if "parent_session_id" not in cols:
+            await self._meta_db.execute(
+                "ALTER TABLE sessions ADD COLUMN parent_session_id TEXT"
+            )
         await self._meta_db.commit()
 
-    async def create_session(self, title: str = "") -> Session:
+    async def create_session(
+        self,
+        title: str = "",
+        kind: str = "user",
+        parent_session_id: str | None = None,
+    ) -> Session:
         """创建新会话"""
-        session = Session(title=title)
+        session = Session(title=title, kind=kind, parent_session_id=parent_session_id)
         self._sessions[session.id] = session
 
         await self._meta_db.execute(
-            "INSERT INTO sessions (id, title, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO sessions (id, title, status, created_at, updated_at, kind, parent_session_id)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
             (session.id, session.title, session.status.value,
-             session.created_at.isoformat(), session.updated_at.isoformat()),
+             session.created_at.isoformat(), session.updated_at.isoformat(),
+             session.kind, session.parent_session_id),
         )
         await self._meta_db.commit()
-        logger.info("创建会话: %s", session.id[:8])
+        logger.info("创建会话: %s (kind=%s)", session.id[:8], kind)
         return session
 
     async def get_session(self, session_id: str) -> Session | None:
@@ -70,7 +90,8 @@ class SessionManager:
 
         # 从数据库恢复
         cursor = await self._meta_db.execute(
-            "SELECT id, title, status, created_at, updated_at FROM sessions WHERE id = ?",
+            "SELECT id, title, status, created_at, updated_at, kind, parent_session_id "
+            "FROM sessions WHERE id = ?",
             (session_id,),
         )
         row = await cursor.fetchone()
@@ -79,6 +100,8 @@ class SessionManager:
 
         session = Session(
             id=row[0], title=row[1], status=SessionStatus(row[2]),
+            kind=(row[5] or "user"),
+            parent_session_id=row[6],
         )
         # 恢复消息历史
         messages = await self._memory.get_messages(session_id)
@@ -121,13 +144,86 @@ class SessionManager:
                 ))
         return sessions
 
-    async def get_or_create_session(self, session_id: str | None = None) -> Session:
-        """获取现有会话或创建新会话"""
+    async def get_or_create_session(
+        self,
+        session_id: str | None = None,
+        title: str = "",
+        kind: str = "user",
+        parent_session_id: str | None = None,
+    ) -> Session:
+        """获取现有会话或创建新会话
+
+        若传入 session_id 且该会话已存在 → 返回现有会话；
+        若传入 session_id 但不存在 → **以该 ID 本身登记一条新会话**；
+        若未传入 session_id → 创建一条全新的随机 ID 会话。
+        """
         if session_id:
-            session = await self.get_session(session_id)
-            if session:
-                return session
-        return await self.create_session()
+            existing = await self.get_session(session_id)
+            if existing:
+                return existing
+            session = Session(
+                id=session_id,
+                title=title,
+                kind=kind,
+                parent_session_id=parent_session_id,
+            )
+            self._sessions[session_id] = session
+            await self._meta_db.execute(
+                "INSERT OR IGNORE INTO sessions "
+                "(id, title, status, created_at, updated_at, kind, parent_session_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (session.id, session.title, session.status.value,
+                 session.created_at.isoformat(), session.updated_at.isoformat(),
+                 session.kind, session.parent_session_id),
+            )
+            await self._meta_db.commit()
+            logger.info("登记会话: %s (kind=%s)", session_id[:24], kind)
+            return session
+        return await self.create_session(title=title, kind=kind, parent_session_id=parent_session_id)
+
+    async def get_or_create_subagent_session(
+        self,
+        session_id: str,
+        title: str = "",
+        parent_session_id: str | None = None,
+    ) -> Session:
+        """以指定 ID 登记或获取一个 subagent 会话。
+
+        新创建时自动把 kind 标记为 "subagent"，便于 DAG 完成后按父会话归组清理。
+        """
+        return await self.get_or_create_session(
+            session_id,
+            title=title,
+            kind="subagent",
+            parent_session_id=parent_session_id,
+        )
+
+    async def archive_subagent_sessions(
+        self,
+        session_ids: list[str] | set[str],
+    ) -> int:
+        """把一批 subagent session 标记为 archived 并从缓存驱逐。
+
+        用于 DAG 执行完毕后归档子任务会话，避免 list_sessions 里混入大量临时 session。
+        消息行由 MemoryStore 持有，不在这里删除（便于日后审计/调试）。
+
+        Returns:
+            实际被归档的会话数
+        """
+        archived = 0
+        for sid in list(session_ids):
+            cursor = await self._meta_db.execute(
+                "UPDATE sessions SET status = 'archived' WHERE id = ? AND kind = 'subagent'",
+                (sid,),
+            )
+            if cursor.rowcount:
+                archived += cursor.rowcount
+            # 驱逐缓存，防止旧对象长期持有大量消息
+            self._sessions.pop(sid, None)
+        await self._meta_db.commit()
+        if archived:
+            logger.info("归档 subagent 会话: %d 条", archived)
+        return archived
 
     async def close(self) -> None:
         if hasattr(self, "_meta_db") and self._meta_db:

@@ -112,25 +112,120 @@ class SubagentExecutor:
 
         self._contexts[task.id] = ctx
         return ctx
-
     async def get_tool_set(self, task_id: str) -> IsolatedToolSet | None:
         """获取任务的隔离工具集"""
         ctx = self._contexts.get(task_id)
         return ctx.tool_set if ctx else None
-
     async def get_workspace_path(self, task_id: str) -> Path | None:
         """获取任务的 worktree 路径"""
         ctx = self._contexts.get(task_id)
         if ctx and ctx.workspace:
             return ctx.workspace.worktree_path
         return None
-
     async def get_workspace_branch(self, task_id: str) -> str | None:
         """获取任务的 worktree 分支名（用于依赖任务的 parent_branch）"""
         ctx = self._contexts.get(task_id)
         if ctx and ctx.workspace and ctx.workspace.worktree_info:
             return ctx.workspace.worktree_info.branch_name
         return None
+    def has_context(self, task_id: str) -> bool:
+        """判断某个任务的执行上下文是否仍存在"""
+        return task_id in self._contexts
+    def list_active_task_ids(self) -> list[str]:
+        """列出所有仍活跃的任务 id（含已提交但待合并）"""
+        return list(self._contexts.keys())
+    def get_workspace_snapshot(self, task_id: str):
+        """返回 IsolatedWorkspace 的快照引用（只读用）。不存在返回 None。"""
+        ctx = self._contexts.get(task_id)
+        return ctx.workspace if ctx else None
+    async def force_cleanup_workspace(self, task_id: str) -> bool:
+        """强制清理某个任务的 worktree（失败路径兜底）"""
+        if task_id not in self._contexts:
+            return False
+        return await self._isolator.cleanup_workspace(task_id, force=True)
+    async def merge_workspace_to_parent(
+        self,
+        task_id: str,
+        delete_branch: bool = True,
+    ) -> dict[str, Any]:
+        """把某个任务的 worktree 合并到父分支"""
+        return await self._isolator._worktree_mgr.merge_to_parent(
+            worktree_id=task_id,
+            delete_branch=delete_branch,
+        )
+
+    async def commit_workspace(
+        self,
+        task_id: str,
+        message: str | None = None,
+    ) -> dict[str, Any]:
+        """在子任务的 worktree 内提交未提交的改动到分支。
+
+        关键作用：
+          1. 让下游（depends_on=[task_id]）的任务在基于
+             subagent-<task_id> 分支创建 worktree 时能看到产物。
+          2. 把 IsolatedWorkspace.is_committed 设为 True，
+             让 _finalize_dag_worktrees 在 DAG 完成时正确触发 merge 流程
+             —— 之前直接调 worktree_mgr 绕过了 isolator，标志没更新，
+             finalize 阶段以为没人 commit 过，merge 被整个跳过。
+        """
+        result = await self._isolator._worktree_mgr.commit_changes(
+            worktree_id=task_id,
+            message=message,
+        )
+        if result.get("committed"):
+            workspace = self._isolator._workspaces.get(task_id)
+            if workspace is not None:
+                workspace.is_committed = True
+        return result
+    async def remove_worktree(self, task_id: str, force: bool = True) -> bool:
+        """移除某个任务的 worktree"""
+        return await self._isolator._worktree_mgr.remove_worktree(
+            worktree_id=task_id, force=force,
+        )
+    async def merge_dependency_branches(
+        self,
+        source_branches: list[str],
+        target_branch_name: str,
+    ) -> dict[str, Any]:
+        """将多个依赖分支合并到一个中间分支（多依赖任务用）"""
+        return await self._isolator._worktree_mgr.merge_branches_into_new_branch(
+            source_branches=source_branches,
+            target_branch_name=target_branch_name,
+        )
+    async def delete_branch(self, branch_name: str) -> bool:
+        """删除某个分支（中间合并分支清理）"""
+        return await self._isolator._worktree_mgr.delete_branch(branch_name)
+
+    async def detect_user_branch(self) -> str:
+        """检测用户工作分支（master 进程启动时 repo_root 所在的分支）。
+
+        DAG 完成后所有叶子分支应合并到这条分支，对应原设计:
+            "Master Agent 收到结果报告后，在主干目录执行 git merge subagent-{taskId}"
+        """
+        return await self._isolator._worktree_mgr._detect_default_branch()
+
+    async def merge_branch_to_target(
+        self,
+        task_id: str,
+        target_branch: str,
+        delete_branch: bool = False,
+    ) -> dict[str, Any]:
+        """把指定 task 的 subagent 分支合并到目标分支（通常是用户分支）。
+
+        与 merge_workspace_to_parent 不同 —— 后者合并到 worktree 创建时
+        指定的 parent_branch（在依赖任务里就是上游分支），导致叶子任务
+        产物只回到上游分支而不是主干。这个方法允许显式指定目标。
+        """
+        return await self._isolator._worktree_mgr.merge_to_parent(
+            worktree_id=task_id,
+            parent_branch=target_branch,
+            delete_branch=delete_branch,
+        )
+    @property
+    def auto_cleanup(self) -> bool:
+        """暴露 isolator 的 auto_cleanup 配置"""
+        return self._isolator._auto_cleanup
 
     async def collect_result(
         self,

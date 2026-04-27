@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import subprocess
 from dataclasses import dataclass, field
 from enum import Enum
@@ -431,12 +432,18 @@ class RunTestsTool(Tool):
 
         cmd = self._build_test_command(runner, test_files, coverage)
 
+        # 禁用 .pyc 生成：worktree 内 pytest 产生的 __pycache__ 会和主仓库的
+        # __pycache__ 冲突，导致 git merge 拒绝覆盖未跟踪文件。从源头不生成。
+        env = os.environ.copy()
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+
         try:
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(self._worktree_root),
+                env=env,
             )
 
             stdout, stderr = await process.communicate()
@@ -524,15 +531,33 @@ class RunTestsTool(Tool):
         stdout: str,
         stderr: str,
     ) -> ValidationResult:
-        """解析测试输出"""
-        errors = []
-        warnings = []
+        """解析测试输出
+
+        语义优先级（决定最终 status）:
+          1. pytest exit_code == 5 (no tests collected) → ERROR
+             "没有测试可跑" 不是失败，而是"无法验证"。
+          2. exit_code == 0 → PASSED
+          3. exit_code != 0 → FAILED
+        """
+        import re
+
+        errors: list[dict[str, Any]] = []
+        warnings: list[dict[str, Any]] = []
+        message: str
+        status: ValidationStatus
 
         if runner == "pytest":
-            # 解析 pytest 输出
-            import re
+            # exit_code 5 = "no tests ran"，区别于 1/2/3/4 的真失败
+            if exit_code == 5:
+                return ValidationResult(
+                    tool_name="run_tests",
+                    status=ValidationStatus.ERROR,
+                    message="未发现可执行的测试用例（pytest exit_code=5）",
+                    errors=[],
+                    warnings=[],
+                )
 
-            # 查找失败的测试
+            # 失败用例
             failed_pattern = r"FAILED (.*?) - (.*?)(?:\n|$)"
             for match in re.finditer(failed_pattern, stdout):
                 errors.append({
@@ -540,18 +565,25 @@ class RunTestsTool(Tool):
                     "message": match.group(2).strip()[:200],
                 })
 
-            # 查找错误摘要
-            summary_pattern = r"(\d+) failed"
-            summary_match = re.search(summary_pattern, stdout)
-            if summary_match:
-                message = f"{summary_match.group(1)} 个测试失败"
+            summary_match = re.search(r"(\d+) failed", stdout)
+            passed_match = re.search(r"(\d+) passed", stdout)
+
+            if exit_code == 0:
+                status = ValidationStatus.PASSED
+                message = (
+                    f"{passed_match.group(1)} 个测试通过"
+                    if passed_match else "测试通过"
+                )
             else:
-                message = "测试通过"
+                status = ValidationStatus.FAILED
+                if summary_match:
+                    message = f"{summary_match.group(1)} 个测试失败"
+                elif stderr.strip():
+                    message = f"pytest 退出码 {exit_code}: {stderr.strip()[:120]}"
+                else:
+                    message = f"pytest 退出码 {exit_code}（未识别失败列表）"
 
         elif runner == "jest":
-            # 解析 jest 输出
-            import re
-
             failed_pattern = r"FAIL (.*?)(?:\n|$)"
             for match in re.finditer(failed_pattern, stdout):
                 errors.append({
@@ -559,20 +591,30 @@ class RunTestsTool(Tool):
                     "message": "测试失败",
                 })
 
-            # 查找摘要
-            summary_pattern = r"Tests:\s+(\d+) failed"
-            summary_match = re.search(summary_pattern, stdout)
-            if summary_match:
-                message = f"{summary_match.group(1)} 个测试失败"
+            summary_match = re.search(r"Tests:\s+(\d+) failed", stdout)
+            passed_match = re.search(r"Tests:.*?(\d+) passed", stdout)
+
+            if exit_code == 0:
+                status = ValidationStatus.PASSED
+                message = (
+                    f"{passed_match.group(1)} 个测试通过"
+                    if passed_match else "测试通过"
+                )
             else:
-                message = "测试通过"
+                status = ValidationStatus.FAILED
+                message = (
+                    f"{summary_match.group(1)} 个测试失败"
+                    if summary_match else f"jest 退出码 {exit_code}"
+                )
 
         else:
-            message = stdout[:200] if stdout else "测试完成"
-            if exit_code != 0:
-                errors.append({"message": stderr[:200] if stderr else "测试失败"})
-
-        status = ValidationStatus.PASSED if exit_code == 0 else ValidationStatus.FAILED
+            if exit_code == 0:
+                status = ValidationStatus.PASSED
+                message = stdout[:200] if stdout else "测试完成"
+            else:
+                status = ValidationStatus.FAILED
+                message = stderr[:200] if stderr else f"测试失败 (退出码 {exit_code})"
+                errors.append({"message": message})
 
         return ValidationResult(
             tool_name="run_tests",

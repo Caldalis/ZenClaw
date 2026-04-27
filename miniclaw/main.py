@@ -110,18 +110,32 @@ async def bootstrap_master_subagent(config: Settings) -> dict:
     provider_registry = ProviderRegistry(config.providers)
     logger.info("AI 提供商已初始化: %d 个", provider_registry.provider_count)
 
-    # 5. 基础 Agent（Master Agent 底层使用）
+    # 5. 基础 Agent
+    from miniclaw.tools.registry import ToolRegistry
+    master_view_registry = ToolRegistry()
+    master_whitelist = ("create_task_graph", "load_skill")
+    for tool_name in master_whitelist:
+        tool = tool_registry.get(tool_name)
+        if tool is not None:
+            master_view_registry.register(tool)
+        else:
+            logger.warning("Master 白名单工具未注册: %s", tool_name)
+    logger.info(
+        "Master 工具白名单已构建: %d 个 (%s)",
+        master_view_registry.tool_count,
+        ", ".join(master_whitelist),
+    )
+
     master_config = create_master_agent_config()
     base_agent = Agent(
         config=master_config,
         memory_config=config.memory,
         provider_registry=provider_registry,
-        tool_registry=tool_registry,
+        tool_registry=master_view_registry,
         session_manager=session_mgr,
         memory_store=memory,
     )
     logger.info("基础 Agent 已初始化")
-
     # 6. Subagent Orchestrator
     repo_root = Path.cwd()
     orchestrator = await create_orchestrator(
@@ -130,6 +144,7 @@ async def bootstrap_master_subagent(config: Settings) -> dict:
         session_manager=session_mgr,
         memory_store=memory,
         repo_root=repo_root,
+        full_tool_registry=tool_registry,
     )
     logger.info("Subagent Orchestrator 已初始化")
 

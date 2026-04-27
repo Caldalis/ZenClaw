@@ -149,6 +149,9 @@ class TaskGraphResult(BaseModel):
     task_errors: dict[str, str] = Field(default_factory=dict)
     """失败任务的错误详情 (task_id -> error_message)"""
 
+    task_dependencies: dict[str, list[str]] = Field(default_factory=dict)
+    """每个任务的依赖列表 (task_id -> [dep_id, ...])"""
+
     @property
     def is_complete(self) -> bool:
         """任务图是否全部完成"""
@@ -180,19 +183,24 @@ class ExecutionPlan(BaseModel):
     critical_path: list[str]
     """关键路径（最长依赖链）"""
 
+    task_dependencies: dict[str, list[str]] = Field(default_factory=dict)
+    """每个任务的依赖列表 (task_id -> [dep_id, ...])"""
+
     def get_ready_tasks(self, completed_ids: set[str], running_ids: set[str]) -> list[str]:
         """获取当前准备好执行的任务
 
         条件:
           1. 所有依赖已完成
           2. 当前未在执行中
+          3. 当前未已完成
         """
         ready = []
         for level in self.levels:
             for task_id in level:
-                if task_id not in completed_ids and task_id not in running_ids:
-                    # 找到该任务的依赖
-                    # 这里需要外部信息，简化实现
+                if task_id in completed_ids or task_id in running_ids:
+                    continue
+                deps = self.task_dependencies.get(task_id, [])
+                if all(dep_id in completed_ids for dep_id in deps):
                     ready.append(task_id)
         return ready
 
@@ -327,10 +335,13 @@ def build_task_graph_result(request: TaskGraphRequest) -> TaskGraphResult:
 
     max_depth = len(execution_order) - 1 if execution_order else 0
 
+    task_dependencies = {t.id: list(t.depends_on) for t in request.tasks}
+
     return TaskGraphResult(
         total_tasks=len(request.tasks),
         max_depth=max_depth,
         execution_order=execution_order,
         dynamic_roles=dynamic_roles,
         status="pending",
+        task_dependencies=task_dependencies,
     )

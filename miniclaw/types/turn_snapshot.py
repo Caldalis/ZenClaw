@@ -40,6 +40,11 @@ class AgentNode(BaseModel):
     max_steps: int = 15                # 最大 ReAct 步数
     timeout_ms: int = 120000           # 超时时间（毫秒）
 
+    # 完成状态：spawn_agent 用此字段判断子节点是否已结束。
+    # 不依赖 DAG.completed_nodes/failed_nodes，因为 master_node 跨 DAG 复用时
+    # 旧子节点不在新 DAG 的状态列表里，会被误判成"在跑"。
+    is_finished: bool = False
+
 
 class TurnSnapshot(BaseModel):
     """Turn 状态快照

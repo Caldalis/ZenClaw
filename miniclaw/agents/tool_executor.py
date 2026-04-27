@@ -33,10 +33,14 @@ class ToolExecutor:
         tool_registry: ToolRegistry,
         tool_result_max_bytes: int = 102400,
         validation_gatekeeper: Any = None,
+        tool_circuit_breaker: Any = None,
     ):
         self._registry = tool_registry
         self._max_bytes = tool_result_max_bytes
         self._gatekeeper = validation_gatekeeper
+        # 可选：本 Agent 局部的 CircuitBreaker，用于检测"工具结构化失败重复"
+        # （例如 run_linter 反复返回 status=error 而不抛异常）。
+        self._tool_breaker = tool_circuit_breaker
 
     async def execute(
         self,
@@ -132,3 +136,12 @@ class ToolExecutor:
 
         self._gatekeeper.record_validation(tool_name, result)
         logger.info("验证结果已记录: tool=%s, status=%s", tool_name, status.value)
+
+        # 把"结构化失败"喂给熔断器，让它在 N 次相同失败后跳闸
+        # （否则 agent 看到 ERROR 后会反复试，没有任何机制能打断）
+        if self._tool_breaker and status in (ValidationStatus.ERROR, ValidationStatus.FAILED):
+            self._tool_breaker.record_tool_failure(
+                tool_name=tool_name,
+                status=status.value,
+                message=data.get("message", ""),
+            )

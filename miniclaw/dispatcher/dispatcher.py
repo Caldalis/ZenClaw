@@ -142,6 +142,11 @@ class Dispatcher:
         self._timeout_monitor = TimeoutMonitor(event_bus)
         self._active_dags: dict[str, TaskDAG] = {}  # dag_id -> DAG
         self._agent_count: int = 0  # 全局 Agent 计数（用于护栏检查）
+        # 跨 DAG 的全局节点索引：master_node 在多轮中复用，children_ids 会累积
+        # 老子节点。靠当前 DAG 的 completed_nodes/failed_nodes 判断"是否完成"
+        # 会漏掉跨 DAG 的老子节点。这里集中存所有曾创建过的 AgentNode 引用，
+        # 由 complete_agent/fail_agent 写 is_finished，spawn_agent 用它算活跃数。
+        self._node_index: dict[str, AgentNode] = {}
 
     async def initialize(self) -> None:
         """初始化 Dispatcher"""
@@ -181,6 +186,8 @@ class Dispatcher:
 
         self._active_dags[dag.dag_id] = dag
         self._agent_count += 1
+        # 注册根节点到全局索引（master_node 复用时直接命中已有条目）
+        self._node_index.setdefault(root_agent_id, root_node)
 
         await self._event_bus.save_dag_state(dag)
         logger.info("DAG 已创建: %s, root=%s", dag.dag_id, root_agent_id)
@@ -217,9 +224,21 @@ class Dispatcher:
             raise DispatcherError(f"父节点不存在: {parent_id}")
 
         # 护栏检查
+        # 注意：max_children_per_agent 限制的是"同时在跑的并发子节点数"，
+        # 而不是"父节点这辈子总共派过多少子节点"。已完成/失败的子节点不应
+        # 计入活跃数 —— 否则 master 派过一轮 N 个任务后就再也不能重派任何
+        # 新任务（重试机制失效）。
+        # 跨 DAG 时，旧子节点不在新 DAG 的 completed_nodes/failed_nodes 里，
+        # 所以靠 AgentNode.is_finished（dispatcher 在 complete/fail 时打标）
+        # 来判断，配合 _node_index 跨 DAG 查。
+        active_children = 0
+        for cid in parent_node.children_ids:
+            child = self._node_index.get(cid) or dag.nodes.get(cid)
+            if child is None or not child.is_finished:
+                active_children += 1
         self._registry.check_can_spawn(
             caller_depth=parent_node.depth,
-            caller_children_count=len(parent_node.children_ids),
+            caller_children_count=active_children,
             caller_id=parent_id,
             total_agent_count=self._agent_count,
         )
@@ -250,6 +269,9 @@ class Dispatcher:
         dag.nodes[new_node.agent_id] = new_node
         dag.edges.append((parent_id, new_node.agent_id))
         dag.pending_nodes.append(new_node.agent_id)
+
+        # 注册到全局节点索引（跨 DAG 时仍可查 is_finished）
+        self._node_index[new_node.agent_id] = new_node
 
         self._agent_count += 1
 
@@ -389,6 +411,10 @@ class Dispatcher:
         if agent_id not in dag.completed_nodes:
             dag.completed_nodes.append(agent_id)
 
+        node = self._node_index.get(agent_id) or dag.nodes.get(agent_id)
+        if node is not None:
+            node.is_finished = True
+
         await self._event_bus.save_dag_state(dag)
         logger.info("Agent 已完成: %s (dag=%s)", agent_id, dag.dag_id)
 
@@ -403,6 +429,10 @@ class Dispatcher:
             dag.pending_nodes.remove(agent_id)
         if agent_id not in dag.failed_nodes:
             dag.failed_nodes.append(agent_id)
+
+        finished_node = self._node_index.get(agent_id) or dag.nodes.get(agent_id)
+        if finished_node is not None:
+            finished_node.is_finished = True
 
         await self._event_bus.save_dag_state(dag)
 

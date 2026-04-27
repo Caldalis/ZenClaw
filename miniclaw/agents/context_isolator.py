@@ -41,6 +41,12 @@ class IsolationConfig:
     summary_max_length: int = 500
     """摘要最大长度"""
 
+    max_dependency_result_length: int = 2000
+    """每个依赖任务结果的最大长度"""
+
+    max_dependency_total_length: int = 8000
+    """所有依赖任务结果合计的最大长度"""
+
 
 @dataclass
 class IsolatedContext:
@@ -61,7 +67,13 @@ class IsolatedContext:
     """父 Agent 的关键决策"""
 
     dependencies_results: dict[str, str] = field(default_factory=dict)
-    """依赖任务的执行结果"""
+    """依赖任务的执行结果文本摘要"""
+
+    dependencies_files_changed: dict[str, list[str]] = field(default_factory=dict)
+    """依赖任务修改/创建的文件列表 (task_id -> [file_paths])"""
+
+    dependencies_status: dict[str, str] = field(default_factory=dict)
+    """依赖任务的状态 (task_id -> 'success'/'partial_success'/'failed')"""
 
     def to_messages(self) -> list[dict[str, str]]:
         """转换为消息列表格式"""
@@ -89,12 +101,20 @@ class IsolatedContext:
                 "content": f"[相关文件]\n{files_text}",
             })
 
-        # 依赖任务结果
-        if self.dependencies_results:
-            results_text = "\n\n".join(
-                f"**{task_id}**:\n{result}"
-                for task_id, result in self.dependencies_results.items()
-            )
+        # 依赖任务结果 — 包含状态、摘要、修改文件列表
+        if self.dependencies_results or self.dependencies_files_changed:
+            deps_parts = []
+            for task_id, result_text in self.dependencies_results.items():
+                dep_lines = [f"**{task_id}**:"]
+                if task_id in self.dependencies_status:
+                    dep_lines.append(f"  状态: {self.dependencies_status[task_id]}")
+                dep_lines.append(f"  {result_text}")
+                if task_id in self.dependencies_files_changed and self.dependencies_files_changed[task_id]:
+                    files = self.dependencies_files_changed[task_id]
+                    dep_lines.append(f"  修改/创建的文件: {', '.join(files)}")
+                deps_parts.append("\n".join(dep_lines))
+
+            results_text = "\n\n".join(deps_parts)
             messages.append({
                 "role": "system",
                 "content": f"[依赖任务结果]\n{results_text}",
@@ -134,6 +154,7 @@ class ContextIsolator:
         instruction: str,
         master_messages: list[Message] = [],
         task_dependencies: dict[str, str] = {},
+        dependency_structured_results: dict[str, dict[str, Any]] | None = None,
         relevant_files: list[str] = [],
         context_summary: str = "",
     ) -> IsolatedContext:
@@ -142,7 +163,9 @@ class ContextIsolator:
         Args:
             instruction: 任务指令（必须）
             master_messages: Master Agent 的历史消息（将被精简）
-            task_dependencies: 依赖任务的执行结果
+            task_dependencies: 依赖任务的执行结果文本摘要
+            dependency_structured_results: 依赖任务的结构化结果 (task_id -> StructuredResult dict)
+                包含 status, files_changed, summary 等完整信息
             relevant_files: 相关文件列表
             context_summary: 可选的上下文摘要
 
@@ -159,8 +182,28 @@ class ContextIsolator:
             decisions=decisions,
         )
 
-        # 精简依赖结果
+        # 精简依赖结果文本
         trimmed_deps = self._trim_dependencies(task_dependencies)
+
+        # 从结构化结果中提取文件变更和状态信息
+        dep_files_changed: dict[str, list[str]] = {}
+        dep_status: dict[str, str] = {}
+
+        if dependency_structured_results:
+            for task_id, result_data in dependency_structured_results.items():
+                if isinstance(result_data, dict):
+                    files = result_data.get("files_changed", [])
+                    if isinstance(files, list):
+                        dep_files_changed[task_id] = [str(f) for f in files]
+                    status = result_data.get("status", "")
+                    if status:
+                        dep_status[task_id] = str(status)
+
+                    # 如果没有文本摘要，用结构化结果的 summary 字段补充
+                    if task_id not in trimmed_deps:
+                        summary_text = result_data.get("summary", "")
+                        if summary_text:
+                            trimmed_deps[task_id] = summary_text
 
         return IsolatedContext(
             system_prompt="",  # 由 SubagentFactory 填充
@@ -169,6 +212,8 @@ class ContextIsolator:
             relevant_files=relevant_files[:10],  # 最多 10 个文件
             parent_decisions=decisions[:5],  # 最多 5 个决策
             dependencies_results=trimmed_deps,
+            dependencies_files_changed=dep_files_changed,
+            dependencies_status=dep_status,
         )
 
     def _extract_key_decisions(
@@ -261,14 +306,27 @@ class ContextIsolator:
         self,
         dependencies: dict[str, str],
     ) -> dict[str, str]:
-        """精简依赖结果"""
+        """精简依赖结果 — 每个结果不超过 max_dependency_result_length，
+        所有结果合计不超过 max_dependency_total_length"""
         trimmed = {}
+        total_length = 0
 
         for task_id, result in dependencies.items():
-            # 限制每个结果的长度
-            if len(result) > 500:
-                result = result[:497] + "..."
+            # 单个结果长度限制
+            max_single = self.config.max_dependency_result_length
+            if len(result) > max_single:
+                result = result[:max_single - 3] + "..."
+
+            # 总长度限制 — 如果累计已超出，截断后续结果
+            remaining = self.config.max_dependency_total_length - total_length
+            if remaining <= 0:
+                break
+
+            if len(result) > remaining:
+                result = result[:remaining - 3] + "..."
+
             trimmed[task_id] = result
+            total_length += len(result)
 
         return trimmed
 
@@ -277,6 +335,7 @@ def create_isolated_context(
     instruction: str,
     master_messages: list[Message] = [],
     task_dependencies: dict[str, str] = {},
+    dependency_structured_results: dict[str, dict[str, Any]] | None = None,
     relevant_files: list[str] = [],
     context_summary: str = "",
 ) -> IsolatedContext:
@@ -286,6 +345,7 @@ def create_isolated_context(
         instruction=instruction,
         master_messages=master_messages,
         task_dependencies=task_dependencies,
+        dependency_structured_results=dependency_structured_results,
         relevant_files=relevant_files,
         context_summary=context_summary,
     )

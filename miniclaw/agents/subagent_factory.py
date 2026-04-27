@@ -22,11 +22,23 @@ from miniclaw.agents.prompts.role_prompts import (
     merge_role_config,
 )
 from miniclaw.dispatcher.subagent_registry import SubagentSpec
+from miniclaw.tools.base import Tool
+from miniclaw.tools.registry import ToolRegistry
 from miniclaw.types.enums import AgentRole
 from miniclaw.types.task_graph import TaskNode
 from miniclaw.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+# subagent 隔离版本的文件/终端工具名（master 里叫 terminal_command，
+# 隔离版叫 terminal —— 这里两个都列进来，避免 master 的 terminal_command
+# 被复制到 subagent 里绕过 worktree 沙箱）
+ISOLATED_TOOL_NAMES: frozenset[str] = frozenset({
+    "read_file", "write_file", "edit_file",
+    "ls", "glob", "grep",
+    "terminal", "terminal_command",
+})
 
 
 @dataclass
@@ -61,6 +73,14 @@ class SubagentConfig:
     # 隔离配置
     requires_worktree: bool = False
     """是否需要 Git Worktree 物理隔离"""
+
+    # 验证门禁
+    # 仅产出代码的角色（CoderAgent / TesterAgent）需要 lint/tests 验证后才能提交。
+    # 只读角色（ReviewerAgent / SearcherAgent / PlannerAgent）不写文件，强制验证
+    # 会让它们在工具表里多出无用的 run_linter/run_tests，并在 prompt 提示下死循环
+    # 试遍每种 linter。
+    requires_validation: bool = True
+    """提交前是否必须先通过 run_linter 或 run_tests 验证"""
 
     # 上下文信息
     context_summary: str = ""
@@ -191,6 +211,7 @@ class SubagentFactory:
             max_steps=merged.get("max_steps", 15),
             timeout_ms=merged.get("timeout_ms", 120000),
             requires_worktree=merged.get("requires_worktree", False),
+            requires_validation=merged.get("requires_validation", True),
         )
 
     def _create_dynamic_config(
@@ -230,6 +251,8 @@ class SubagentFactory:
             max_steps=custom_config.get("max_steps", 15),
             timeout_ms=custom_config.get("timeout_ms", 120000),
             requires_worktree=custom_config.get("requires_worktree", False),
+            # 动态角色默认要求验证（除非显式声明不需要），更稳妥
+            requires_validation=custom_config.get("requires_validation", True),
         )
 
     def _build_full_prompt(
@@ -251,6 +274,100 @@ class SubagentFactory:
     def get_available_roles(self) -> list[str]:
         """获取所有可用角色（预设 + 已注册动态角色）"""
         return list(self._preset_roles.keys())
+
+    def build_tool_registry(
+        self,
+        config: SubagentConfig,
+        master_tools: list[Tool],
+        isolated_tools: list[Tool] | None = None,
+        extra_tools: list[Tool] | None = None,
+        submit_tool: Tool | None = None,
+    ) -> ToolRegistry:
+        """根据 SubagentConfig 声明式地组装 Subagent 的工具表
+
+        顺序：
+          1. 从 master_tools 过滤掉隔离版占位（file/terminal）与 submit_task_result
+          2. 按 allowed_tools 白名单过滤（空表示允许所有）
+          3. 按 forbidden_tools 黑名单剔除
+          4. 注入 isolated_tools（隔离版文件/终端工具）
+          5. 注入 extra_tools（验证工具等）
+          6. 注入 submit_tool（已包装的 submit_task_result）
+
+        这一步替换了原来 task_scheduler 里散在的硬编码工具拼装，
+        并让 `CoderAgent.forbidden_tools = ["terminal"]` 等配置真正生效。
+
+        Args:
+            config: Subagent 配置（含 allowed_tools/forbidden_tools）
+            master_tools: Master Agent 的工具实例列表
+            isolated_tools: 隔离版文件/终端工具，worktree 启用时传入
+            extra_tools: 额外注入的工具（如 run_linter / run_tests）
+            submit_tool: 已包装的 submit_task_result（带验证门禁）
+
+        Returns:
+            新的 ToolRegistry 实例
+        """
+        allowed = set(config.allowed_tools or [])
+        forbidden = set(config.forbidden_tools or [])
+
+        def _permitted(name: str) -> bool:
+            if forbidden and name in forbidden:
+                return False
+            if allowed and name not in allowed:
+                return False
+            return True
+
+        registry = ToolRegistry()
+
+        # 1 + 2 + 3. 从 master 过滤
+        for tool in master_tools:
+            if tool.name in ISOLATED_TOOL_NAMES:
+                continue
+            if tool.name == "submit_task_result":
+                continue
+            if not _permitted(tool.name):
+                logger.debug(
+                    "subagent %s 跳过工具 %s（不在白名单或命中黑名单）",
+                    config.role_name, tool.name,
+                )
+                continue
+            registry.register(tool)
+
+        # 4. 隔离版文件/终端工具
+        if isolated_tools:
+            for tool in isolated_tools:
+                if not _permitted(tool.name):
+                    logger.debug(
+                        "subagent %s 跳过隔离工具 %s（被 forbidden_tools 拒绝）",
+                        config.role_name, tool.name,
+                    )
+                    continue
+                registry.register(tool)
+        else:
+            # 没传隔离工具 = 非 worktree 模式，保留 master 的原版文件工具
+            # 注意：此时 terminal_command 依然受 forbidden 限制
+            for tool in master_tools:
+                if tool.name not in ISOLATED_TOOL_NAMES:
+                    continue
+                if not _permitted(tool.name):
+                    continue
+                registry.register(tool)
+
+        # 5. 额外工具（验证工具等）
+        if extra_tools:
+            for tool in extra_tools:
+                registry.register(tool)
+
+        # 6. submit_task_result（无论白名单如何，子任务必须能提交结果）
+        if submit_tool is not None:
+            registry.register(submit_tool)
+
+        logger.info(
+            "subagent %s 工具表已构建: %d 个工具 (allowed=%s, forbidden=%s)",
+            config.role_name, registry.tool_count,
+            sorted(allowed) if allowed else "*",
+            sorted(forbidden) if forbidden else [],
+        )
+        return registry
 
     def validate_role_tools(
         self,

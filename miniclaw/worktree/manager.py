@@ -118,7 +118,124 @@ class WorktreeManager:
         # 清理孤立的 worktree 记录
         await self._prune_stale_worktrees()
 
+        # 回收上次进程崩溃留下的 subagent worktree（.agents/worktrees/subagent-*）。
+        # 这些目录在 `git worktree list` 里仍存在但 self._worktrees 内存里没有，
+        # 新任务分配同名 id 会踩到 "分支已存在，复用分支" 的旧残骸。
+        recovered = await self._recover_stale_subagent_worktrees()
+        if recovered:
+            logger.info("启动时清理 %d 个残留 subagent worktree", recovered)
+
         logger.info("Worktree 管理器已初始化: repo=%s, base=%s", self.repo_root, self.worktree_base)
+
+    async def _recover_stale_subagent_worktrees(self) -> int:
+        """启动时扫描 git worktree list，强制删除 subagent-* 分支留下的残骸。
+
+        策略：只清理我们自己在 `worktree_base` 下创建的目录（以 `subagent-` 开头的分支），
+        避免误删用户手工创建的 worktree。
+
+        Returns:
+            实际被清理的 worktree 数
+        """
+        result = await self._run_git_command(
+            ["worktree", "list", "--porcelain"],
+            cwd=self.repo_root,
+        )
+        if result["exit_code"] != 0:
+            return 0
+
+        # 按块解析：每个 worktree 由一个 "worktree <path>" 起头，紧跟 HEAD / branch 等行
+        blocks: list[dict[str, str]] = []
+        current: dict[str, str] = {}
+        for line in result["stdout"].splitlines():
+            if not line.strip():
+                if current:
+                    blocks.append(current)
+                    current = {}
+                continue
+            if " " in line:
+                key, _, value = line.partition(" ")
+                current[key] = value
+        if current:
+            blocks.append(current)
+
+        cleaned = 0
+        for block in blocks:
+            wt_path = block.get("worktree")
+            branch = block.get("branch", "")
+            if not wt_path:
+                continue
+            wt = Path(wt_path)
+            # 仅清理本 base 目录下且分支名以 refs/heads/subagent- 开头的记录
+            try:
+                rel = wt.resolve().relative_to(self.worktree_base.resolve())
+            except ValueError:
+                continue
+            if not branch.startswith("refs/heads/subagent-") and not str(rel).startswith("subagent-"):
+                continue
+
+            # 强制移除 worktree
+            remove = await self._run_git_command(
+                ["worktree", "remove", "--force", str(wt)],
+                cwd=self.repo_root,
+            )
+            if remove["exit_code"] != 0 and wt.exists():
+                try:
+                    await self._remove_directory(wt)
+                except Exception as e:
+                    logger.warning("清理残留 worktree 目录失败: %s, error=%s", wt, e)
+                    continue
+            logger.info("已清理残留 worktree: %s (branch=%s)", wt, branch)
+            cleaned += 1
+
+        # 最后执行一次 prune 让 git 把索引里的残留清理干净
+        await self._run_git_command(["worktree", "prune"], cwd=self.repo_root)
+
+        # 再清理"幽灵分支"——subagent-* 分支已经没有对应 worktree（worktree 在
+        # 上次进程异常退出后被清掉、但分支还留着）。如果不清理，下一次同 id
+        # 任务 create_worktree 时会撞 "branch already exists" 警告然后重建。
+        cleaned += await self._prune_orphan_subagent_branches()
+        return cleaned
+
+    async def _prune_orphan_subagent_branches(self) -> int:
+        """删除没有 worktree 引用的 subagent-* 残留分支。"""
+        branches = await self._run_git_command(
+            ["for-each-ref", "--format=%(refname:short)", "refs/heads/subagent-"],
+            cwd=self.repo_root,
+        )
+        if branches["exit_code"] != 0:
+            return 0
+
+        # 收集仍在被 worktree 引用的分支，避免误删
+        wt_list = await self._run_git_command(
+            ["worktree", "list", "--porcelain"],
+            cwd=self.repo_root,
+        )
+        live_branches: set[str] = set()
+        if wt_list["exit_code"] == 0:
+            for line in wt_list["stdout"].splitlines():
+                if line.startswith("branch "):
+                    ref = line[len("branch "):].strip()
+                    if ref.startswith("refs/heads/"):
+                        live_branches.add(ref[len("refs/heads/"):])
+
+        deleted = 0
+        for raw in branches["stdout"].splitlines():
+            name = raw.strip()
+            if not name or name in live_branches:
+                continue
+            res = await self._run_git_command(
+                ["branch", "-D", name],
+                cwd=self.repo_root,
+            )
+            if res["exit_code"] == 0:
+                logger.info("已删除幽灵 subagent 分支: %s", name)
+                deleted += 1
+            else:
+                logger.debug(
+                    "删除幽灵分支跳过: %s, stderr=%s",
+                    name, res["stderr"][:200],
+                )
+        return deleted
 
     async def create_worktree(
         self,
@@ -169,17 +286,35 @@ class WorktreeManager:
                 cwd=self.repo_root,
             )
 
-            if result["exit_code"] != 0:
-                # 可能是分支已存在，尝试不创建新分支
-                if "already exists" in result["stderr"]:
-                    logger.info("分支已存在，复用分支: %s", branch_name)
-                    result = await self._run_git_command(
-                        ["worktree", "add", str(worktree_path), branch_name],
-                        cwd=self.repo_root,
+            if result["exit_code"] != 0 and "already exists" in result["stderr"]:
+                # 分支残留 — 来自上次崩溃或同名 task_id 的旧运行。
+                # 之前的逻辑是直接复用旧分支，会把上次的脏文件带进新 worktree
+                # （"幽灵文件"问题）。这里改为强制删除旧分支再重建。
+                logger.warning("分支已存在，强制删除残留分支后重建: %s", branch_name)
+                # 先尝试 prune 一下，避免 "branch is checked out at <some path>" 拒绝
+                await self._run_git_command(["worktree", "prune"], cwd=self.repo_root)
+                delete_result = await self._run_git_command(
+                    ["branch", "-D", branch_name],
+                    cwd=self.repo_root,
+                )
+                if delete_result["exit_code"] != 0:
+                    logger.warning(
+                        "删除残留分支失败（可能仍被 worktree 占用）: %s, stderr=%s",
+                        branch_name, delete_result["stderr"],
                     )
+                # 再次尝试创建
+                result = await self._run_git_command(
+                    [
+                        "worktree", "add",
+                        "-b", branch_name,
+                        str(worktree_path),
+                        parent_branch,
+                    ],
+                    cwd=self.repo_root,
+                )
 
-                if result["exit_code"] != 0:
-                    raise RuntimeError(f"创建 worktree 失败: {result['stderr']}")
+            if result["exit_code"] != 0:
+                raise RuntimeError(f"创建 worktree 失败: {result['stderr']}")
 
             info.status = WorktreeStatus.ACTIVE
             self._worktrees[worktree_id] = info
@@ -227,6 +362,164 @@ class WorktreeManager:
             if result["exit_code"] == 0:
                 return f"origin/{branch}"
         raise RuntimeError(f"无法检测到有效的默认分支: {self.repo_root}（候选: {candidates}）")
+
+    async def merge_branches_into_new_branch(
+        self,
+        source_branches: list[str],
+        target_branch_name: str,
+        base_branch: str | None = None,
+    ) -> dict[str, Any]:
+        """将多个源分支合并到一个新分支（用于多依赖任务创建 worktree）
+
+        当任务 B 依赖 A 和 C 时，需要先将 A 和 C 的分支合并到
+        一个中间分支，然后基于该中间分支创建 B 的 worktree。
+
+        使用 git merge 的 OCTOPUS 策略一次性合并所有依赖分支，
+        避免 checkout 操作（防止与并发任务冲突）。
+
+        Args:
+            source_branches: 要合并的源分支列表
+            target_branch_name: 目标分支名称
+            base_branch: 基础分支（第一个源分支），其他源分支合并到此基础上
+
+        Returns:
+            合并结果，包含 target_branch, merge_conflicts 等
+        """
+        if not source_branches:
+            return {"merged": False, "error": "no source branches"}
+        base_branch = base_branch or source_branches[0]
+        other_branches = [b for b in source_branches if b != base_branch]
+        try:
+            create_result = await self._run_git_command(
+                ["branch", target_branch_name, base_branch],
+                cwd=self.repo_root,
+            )
+            if create_result["exit_code"] != 0:
+                if "already exists" in create_result["stderr"]:
+                    await self._run_git_command(
+                        ["branch", "-D", target_branch_name],
+                        cwd=self.repo_root,
+                    )
+                    create_result = await self._run_git_command(
+                        ["branch", target_branch_name, base_branch],
+                        cwd=self.repo_root,
+                    )
+                    if create_result["exit_code"] != 0:
+                        raise RuntimeError(f"重建中间分支失败: {create_result['stderr']}")
+            if not other_branches:
+                logger.info(
+                    "中间分支已创建（单依赖，无需合并）: %s <- %s",
+                    target_branch_name, base_branch,
+                )
+                return {
+                    "merged": True,
+                    "target_branch": target_branch_name,
+                    "conflict_files": [],
+                    "base_branch": base_branch,
+                    "merged_branches": source_branches,
+                }
+
+            # 使用 GIT_SEQUENCE_EDITOR 环境变量和临时工作目录执行合并
+            # 不切换主仓库的 HEAD，而是使用 worktree 临时 checkout
+            # 但更安全的方法是使用 git read-tree + git merge-tree（低级别）
+            # 这里采用安全策略：创建临时 worktree 执行合并，然后删除临时 worktree
+            # 创建临时目录用于合并操作（不使用主仓库的 worktree 机制）
+            import tempfile
+            temp_dir = Path(tempfile.mkdtemp(prefix="zenclaw_merge_"))
+            # 在临时目录创建 worktree checkout 中间分支
+            worktree_add_result = await self._run_git_command(
+                ["worktree", "add", str(temp_dir), target_branch_name],
+                cwd=self.repo_root,
+            )
+            if worktree_add_result["exit_code"] != 0:
+                # 清理临时目录
+                await self._remove_directory(temp_dir)
+                raise RuntimeError(f"创建临时 worktree 失败: {worktree_add_result['stderr']}")
+            merge_conflicts = []
+            merge_success = True
+            # 逐个合并其他依赖分支（在临时 worktree 中操作）
+            for source_branch in other_branches:
+                merge_result = await self._run_git_command(
+                    ["merge", source_branch, "-m", f"Merge dependency branch {source_branch} into {target_branch_name}"],
+                    cwd=temp_dir,
+                )
+                if merge_result["exit_code"] != 0:
+                    if "CONFLICT" in merge_result["stdout"] or "CONFLICT" in merge_result["stderr"]:
+                        # 获取冲突文件列表
+                        conflict_result = await self._run_git_command(
+                            ["diff", "--name-only", "--diff-filter=U"],
+                            cwd=temp_dir,
+                        )
+                        conflict_files = [
+                            line.strip() for line in conflict_result["stdout"].strip().split("\n")
+                            if line.strip()
+                        ] if conflict_result["exit_code"] == 0 else []
+                        merge_conflicts.extend(conflict_files)
+                        merge_success = False
+                        await self._run_git_command(
+                            ["merge", "--abort"],
+                            cwd=temp_dir,
+                        )
+                        logger.warning(
+                            "依赖分支合并冲突: %s -> %s, 文件: %s, 已中止",
+                            source_branch, target_branch_name, conflict_files,
+                        )
+                    else:
+                        await self._run_git_command(
+                            ["worktree", "remove", "--force", str(temp_dir)],
+                            cwd=self.repo_root,
+                        )
+                        await self._remove_directory(temp_dir)
+                        raise RuntimeError(f"合并依赖分支失败: {merge_result['stderr']}")
+
+            # 清理临时 worktree（合并完成或中止后）
+            await self._run_git_command(
+                ["worktree", "remove", "--force", str(temp_dir)],
+                cwd=self.repo_root,
+            )
+            # 确保临时目录被删除
+            if temp_dir.exists():
+                await self._remove_directory(temp_dir)
+
+            logger.info(
+                "中间分支已创建: %s (基于 %s, 合入 %s, 冲突=%d, 成功=%s)",
+                target_branch_name, base_branch,
+                other_branches, len(merge_conflicts), merge_success,
+            )
+
+            return {
+                "merged": merge_success,
+                "target_branch": target_branch_name,
+                "conflict_files": merge_conflicts,
+                "base_branch": base_branch,
+                "merged_branches": source_branches,
+            }
+
+        except Exception as e:
+            logger.error("创建中间合并分支失败: %s", e)
+
+            # 清理可能的临时 worktree
+            try:
+                await self._run_git_command(
+                    ["worktree", "prune"],
+                    cwd=self.repo_root,
+                )
+            except Exception:
+                pass
+
+            return {"merged": False, "error": str(e)}
+
+    async def delete_branch(self, branch_name: str) -> bool:
+        """删除分支（用于清理中间合并分支）"""
+        result = await self._run_git_command(
+            ["branch", "-D", branch_name],
+            cwd=self.repo_root,
+        )
+        if result["exit_code"] == 0:
+            logger.info("分支已删除: %s", branch_name)
+            return True
+        logger.warning("删除分支失败: %s, error: %s", branch_name, result["stderr"])
+        return False
 
     async def get_worktree(self, worktree_id: str) -> WorktreeInfo | None:
         """获取 worktree 信息"""
