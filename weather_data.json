@@ -1,0 +1,8 @@
+{
+  "temperature": "32 °C",
+  "humidity": "20 %",
+  "wind_speed": "12 km/h",
+  "AQI": "N/A",
+  "weather_condition": "Sunny",
+  "timestamp": "Beijing, China"
+}
