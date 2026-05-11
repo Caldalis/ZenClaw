@@ -66,6 +66,7 @@ pip install -r requirements.txt
 
 ```bash
 pip install -e .
+# uv tool install --editable .  (更加推荐使用 uv)
 taskweave
 ```
 

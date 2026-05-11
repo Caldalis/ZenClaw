@@ -66,6 +66,7 @@ Optional editable install:
 
 ```bash
 pip install -e .
+# uv tool install --editable .  (uv is more recommended)
 taskweave
 ```
 
