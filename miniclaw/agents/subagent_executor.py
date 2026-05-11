@@ -132,8 +132,18 @@ class SubagentExecutor:
         """判断某个任务的执行上下文是否仍存在"""
         return task_id in self._contexts
     def list_active_task_ids(self) -> list[str]:
-        """列出所有仍活跃的任务 id（含已提交但待合并）"""
-        return list(self._contexts.keys())
+        """列出所有仍活跃的任务 id（含已提交但待合并）
+
+        过滤掉 workspace.is_active=False 的条目：worktree 已被清理的 task_id
+        仍保留在 self._contexts 里供诊断/快照查询，但不应再喂给 DAG 末尾的
+        清理循环（否则下一轮 DAG 清理会把上一轮的死 id 全部"复清"一遍，
+        打出 'Worktree 不存在' 噪声）。
+        """
+        return [
+            task_id
+            for task_id, ctx in self._contexts.items()
+            if ctx.workspace is not None and ctx.workspace.is_active
+        ]
     def get_workspace_snapshot(self, task_id: str):
         """返回 IsolatedWorkspace 的快照引用（只读用）。不存在返回 None。"""
         ctx = self._contexts.get(task_id)
@@ -194,8 +204,22 @@ class SubagentExecutor:
             target_branch_name=target_branch_name,
         )
     async def delete_branch(self, branch_name: str) -> bool:
-        """删除某个分支（中间合并分支清理）"""
+        """删除某个分支（中间合并分支清理，使用 -D 强制语义）"""
         return await self._isolator._worktree_mgr.delete_branch(branch_name)
+
+    async def safe_prune_subagent_branches(
+        self,
+        branch_names: list[str] | None = None,
+    ) -> dict[str, list[str]]:
+        """安全清理 subagent-* 分支（仅删已合并的，未合并保留）。
+
+        DAG finalize 时传入本次 DAG 产生的分支名列表，让叶子和中间节点
+        分支一起回收 —— 中间节点的 commit 通过 git 父子链随叶子 merge
+        进了用户分支，因此对 `git branch -d` 而言同样"已合并"。
+        """
+        return await self._isolator._worktree_mgr.safe_prune_subagent_branches(
+            branch_names=branch_names,
+        )
 
     async def detect_user_branch(self) -> str:
         """检测用户工作分支（master 进程启动时 repo_root 所在的分支）。

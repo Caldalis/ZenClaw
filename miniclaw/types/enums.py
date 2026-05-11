@@ -68,4 +68,20 @@ class AgentRole(str, Enum):
     REVIEWER = "reviewer"      # 代码审查执行者
     TESTER = "tester"          # 测试执行者
     PLANNER = "planner"        # 规划执行者
+    CLEANUP = "cleanup"        # 过程产物清理执行者（无 worktree，直接操作主仓库）
     GENERIC = "generic"        # 通用执行者
+
+
+class NodeStatus(str, Enum):
+    """AgentNode 在 DAG 中的生命周期状态。
+
+    与 TurnStatus 的差别：TurnStatus 追踪"一次 Turn 执行"，NodeStatus 追踪
+    "节点在 DAG 整体生命周期中的位置"。Dispatcher 用 NodeStatus 判断 spawn
+    护栏（active_children）和总量（max_total_agents），EventBus 用 TurnStatus
+    持久化 Turn。两者**正交**，不要混用。
+    """
+    PENDING = "pending"        # 已 spawn 但未开始执行
+    RUNNING = "running"        # 正在执行
+    COMPLETED = "completed"    # 成功完成
+    FAILED = "failed"          # 失败（含超时）
+    CANCELLED = "cancelled"    # 被父节点取消

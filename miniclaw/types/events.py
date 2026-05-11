@@ -59,8 +59,25 @@ class Event(BaseModel):
         )
 
     @classmethod
-    def thinking(cls, session_id: str | None = None) -> Event:
-        return cls(event_type=EventType.THINKING, session_id=session_id)
+    def thinking(
+        cls,
+        session_id: str | None = None,
+        text: str | None = None,
+    ) -> Event:
+        """THINKING 事件。
+
+        text=None 时表示"开始思考/占位心跳"（与原行为兼容）；
+        text=非空时表示从流式输出中提取的一段 <thinking> 内容片段，
+        Channel 可以把它独立渲染（默认浅灰小字）。
+        """
+        data = {}
+        if text is not None:
+            data["text"] = text
+        return cls(
+            event_type=EventType.THINKING,
+            data=data,
+            session_id=session_id,
+        )
 
     @classmethod
     def error(cls, message: str, session_id: str | None = None) -> Event:

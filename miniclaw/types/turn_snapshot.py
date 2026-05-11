@@ -17,7 +17,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from miniclaw.types.enums import AgentRole, TurnStatus
+from miniclaw.types.enums import AgentRole, NodeStatus, TurnStatus
 
 
 class AgentNode(BaseModel):
@@ -40,10 +40,19 @@ class AgentNode(BaseModel):
     max_steps: int = 15                # 最大 ReAct 步数
     timeout_ms: int = 120000           # 超时时间（毫秒）
 
-    # 完成状态：spawn_agent 用此字段判断子节点是否已结束。
-    # 不依赖 DAG.completed_nodes/failed_nodes，因为 master_node 跨 DAG 复用时
-    # 旧子节点不在新 DAG 的状态列表里，会被误判成"在跑"。
-    is_finished: bool = False
+    # 节点生命周期状态。这是 spawn 护栏判断"活跃子节点数"的**唯一事实源**。
+    # TaskDAG 的 pending/running/completed/failed_nodes 列表只是状态变更时
+    # 同步更新的索引缓存，永远以 node.status 为准。
+    status: NodeStatus = NodeStatus.PENDING
+
+    @property
+    def is_finished(self) -> bool:
+        """终态判定：completed/failed/cancelled 任一即视为已结束，spawn 不再计入活跃数。"""
+        return self.status in (
+            NodeStatus.COMPLETED,
+            NodeStatus.FAILED,
+            NodeStatus.CANCELLED,
+        )
 
 
 class TurnSnapshot(BaseModel):
@@ -141,3 +150,43 @@ class TaskDAG(BaseModel):
             if leaf in self.pending_nodes or leaf in self.running_nodes:
                 return leaf
         return None
+    def _drop_from_lists(self, agent_id: str) -> None:
+        for lst in (self.pending_nodes, self.running_nodes,
+                    self.completed_nodes, self.failed_nodes):
+            if agent_id in lst:
+                lst.remove(agent_id)
+    def mark_pending(self, agent_id: str) -> None:
+        node = self.nodes.get(agent_id)
+        if node is None:
+            return
+        node.status = NodeStatus.PENDING
+        self._drop_from_lists(agent_id)
+        self.pending_nodes.append(agent_id)
+    def mark_running(self, agent_id: str) -> None:
+        node = self.nodes.get(agent_id)
+        if node is None:
+            return
+        node.status = NodeStatus.RUNNING
+        self._drop_from_lists(agent_id)
+        self.running_nodes.append(agent_id)
+    def mark_completed(self, agent_id: str) -> None:
+        node = self.nodes.get(agent_id)
+        if node is None:
+            return
+        node.status = NodeStatus.COMPLETED
+        self._drop_from_lists(agent_id)
+        self.completed_nodes.append(agent_id)
+    def mark_failed(self, agent_id: str) -> None:
+        node = self.nodes.get(agent_id)
+        if node is None:
+            return
+        node.status = NodeStatus.FAILED
+        self._drop_from_lists(agent_id)
+        self.failed_nodes.append(agent_id)
+    def mark_cancelled(self, agent_id: str) -> None:
+        node = self.nodes.get(agent_id)
+        if node is None:
+            return
+        node.status = NodeStatus.CANCELLED
+        self._drop_from_lists(agent_id)
+        # cancelled 不进 failed_nodes语义上不是任务失败，但要从其他三个列表移除

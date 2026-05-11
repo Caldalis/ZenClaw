@@ -192,7 +192,7 @@ class SubagentRegistry:
             timeout_ms=self.guardrails.default_timeout_ms,
             requires_worktree=True,
             worktree_prefix="feature/",
-            allowed_tools=["read_file", "write_file", "edit_file", "ls", "glob", "grep", "terminal"],
+            allowed_tools=["read_file", "write_file", "edit_file", "ls", "glob", "grep", "terminal", "load_skill"],
         ))
 
         # Searcher
@@ -204,7 +204,7 @@ class SubagentRegistry:
             max_steps=self.guardrails.default_max_steps,
             timeout_ms=90000,  # 搜索任务通常较快
             requires_worktree=False,
-            allowed_tools=["web_search", "read_file", "grep", "glob"],
+            allowed_tools=["web_search", "read_file", "grep", "glob", "load_skill"],
             forbidden_tools=["write_file", "edit_file", "terminal"],  # 搜索者不应修改文件
             requires_validation=False,
         ))
@@ -219,7 +219,7 @@ class SubagentRegistry:
             timeout_ms=120000,
             requires_worktree=True,
             worktree_prefix="review/",
-            allowed_tools=["read_file", "grep", "glob", "ls"],
+            allowed_tools=["read_file", "grep", "glob", "ls", "load_skill"],
             forbidden_tools=["write_file", "edit_file", "terminal"],  # 审查者不应修改文件
             requires_validation=False,
         ))
@@ -234,7 +234,7 @@ class SubagentRegistry:
             timeout_ms=180000,
             requires_worktree=True,
             worktree_prefix="test/",
-            allowed_tools=["read_file", "write_file", "edit_file", "ls", "glob", "grep", "terminal"],
+            allowed_tools=["read_file", "write_file", "edit_file", "ls", "glob", "grep", "terminal", "load_skill"],
         ))
 
         # Planner
@@ -247,6 +247,28 @@ class SubagentRegistry:
             timeout_ms=90000,
             requires_worktree=False,
             requires_validation=False,
+        ))
+
+        # Cleanup
+        # cleanup 任务的本质是删除已 merge 到主干的过程产物，无需独立 worktree
+        # 删除动作必须走 delete_artifact allowlist，不能暴露通用 terminal
+        # 设 requires_worktree=False 让它直接操作主仓库工作目录，避开 worktree 时序错位 / 脏继承 / no_changes 无法 merge 三个副作用。
+        self.register(SubagentSpec(
+            role=AgentRole.CLEANUP,
+            name="Cleanup Agent",
+            description="过程产物清理执行者，直接在主仓库删除 instruction 列出的 allowlist 文件",
+            system_prompt=(
+                "你是 Cleanup Agent，直接在主仓库工作目录删除 instruction 里"
+                "显式列出的过程产物。完整工作流见 role_prompts."
+                "PRESET_ROLES['CleanupAgent']。"
+            ),
+            max_steps=8,
+            timeout_ms=120000,
+            requires_worktree=False,
+            requires_validation=False,
+            allowed_tools=["ls", "glob", "delete_artifact", "calculator"],
+            forbidden_tools=["write_file", "edit_file", "terminal", "git_resolve_conflict",
+                             "run_linter", "run_tests"],
         ))
 
         # Generic

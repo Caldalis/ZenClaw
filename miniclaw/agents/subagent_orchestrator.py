@@ -101,9 +101,15 @@ class SubagentOrchestrator:
         self._critic_injector: CriticInjector | None = None
         self._validation_gatekeeper: ValidationGatekeeper | None = None
 
-        # 本 Orchestrator 专属的待执行任务图存储（避免模块级单例导致多实例串数据）
+        # 本 Orchestrator 专属的待执行任务图存储（避免模块级单例导致多实例串数据）。
+        # db_path 用 settings 下 _pending_graphs.db，让进程崩溃时仍能恢复未消费的 task graph。
         from miniclaw.tools.builtin.create_task_graph import PendingGraphStore
-        self._pending_graph_store: PendingGraphStore = PendingGraphStore()
+        pending_db_path = self._settings.memory.db_path.replace(
+            ".db", "_pending_graphs.db"
+        )
+        self._pending_graph_store: PendingGraphStore = PendingGraphStore(
+            db_path=pending_db_path,
+        )
 
     async def initialize(self) -> None:
         """初始化所有组件"""
@@ -114,6 +120,14 @@ class SubagentOrchestrator:
         self._event_bus = EventBus(turn_store)
         await self._event_bus.initialize()
         logger.info("EventBus 已初始化")
+
+        # 1b. 初始化持久化 PendingGraphStore（恢复进程崩溃前未消费的 task graph）
+        await self._pending_graph_store.initialize()
+        if len(self._pending_graph_store) > 0:
+            logger.warning(
+                "检测到 %d 个上次未消费的 task graph 请求（已加载到内存）",
+                len(self._pending_graph_store),
+            )
 
         # 2. 初始化 SubagentRegistry
         guardrail_config = GuardrailConfig(
@@ -177,8 +191,85 @@ class SubagentOrchestrator:
         except Exception as e:
             logger.warning("绑定 create_task_graph store 失败: %s", e)
 
+        # 9. 启动时恢复上次进程残留的中断状态
+        await self._recover_interrupted_state()
+
         self._state.is_running = True
         logger.info("SubagentOrchestrator 初始化完成")
+
+    async def _recover_interrupted_state(self) -> None:
+        """启动时检查上次进程崩溃留下的"中断状态"。
+
+        具体做了三件事：
+          1. 扫 turns 表里 status in (pending/running) 的 Turn —— 这些是上次
+             进程崩溃时正在执行的任务，把它们标记为 INTERRUPTED 让用户看到。
+          2. 扫 dag_snapshots 表里有未完成节点的 DAG —— 同样标记并打印。
+          3. 配合 PendingGraphStore.initialize 已恢复的 task graph 请求做汇总。
+
+        注意：这里只做"声明"，不做"自动续跑"。原因：
+          - 自动恢复需要重新打开 worktree、重连 session、找回 critic 状态，
+            链路太长，目前难以做到无副作用。
+          - 改为"声明 + 提示用户" —— 用户可以决定重新发起请求或手工清理。
+        """
+        if self._event_bus is None:
+            return
+
+        try:
+            interrupted_turns = await self._event_bus.get_all_interrupted()
+        except Exception as e:
+            logger.warning("查询中断 Turn 失败: %s", e)
+            return
+
+        if not interrupted_turns:
+            logger.debug("无中断状态需要恢复")
+            return
+
+        # 把这些 Turn 标记为 INTERRUPTED（语义上与崩溃前的 pending/running 区分）
+        marked = 0
+        for snap in interrupted_turns:
+            try:
+                await self._event_bus.record_turn_interrupted(snap)
+                marked += 1
+            except Exception as e:
+                logger.debug("标记 Turn 中断失败: turn=%s, error=%s", snap.turn_id, e)
+
+        # 收集相关 DAG（去重）
+        dag_ids: set[str] = set()
+        for snap in interrupted_turns:
+            # AgentNode 没有显式 dag_id；通过 session_id 匹配 dag_snapshots 不太靠谱。
+            # 这里只汇总 turn 数和涉及 agent_id 给用户看。
+            dag_ids.add(snap.node.session_id)
+
+        pending_count = len(self._pending_graph_store)
+
+        logger.warning(
+            "==================== 检测到中断状态 ====================\n"
+            "  - 中断 Turn 数: %d (已标记为 INTERRUPTED)\n"
+            "  - 涉及 session: %d\n"
+            "  - 未消费的 task graph 请求: %d\n"
+            "提示: 系统不会自动续跑，请重新发起请求；"
+            "如果需要查看历史，可读 turns DB（%s）。\n"
+            "========================================================",
+            marked,
+            len(dag_ids),
+            pending_count,
+            self._settings.memory.db_path.replace(".db", "_turns.db"),
+        )
+
+        # 标记完中断状态后，按日期清理过期 turn 记录（含本次新标的 INTERRUPTED）。
+        # 放在 record_turn_interrupted 之后是有意的：本次启动新标的中断若已
+        # 超过 retention 天数，也一并清掉，避免"标了又留"的语义浪费。
+        retention_days = getattr(
+            self._settings.subagent, "turn_log_retention_days", 0,
+        )
+        if retention_days > 0:
+            try:
+                # 直接调底层 store 的 purge_older_than（EventBus 没有对应转发方法）
+                store = getattr(self._event_bus, "_store", None)
+                if store is not None and hasattr(store, "purge_older_than"):
+                    await store.purge_older_than(retention_days)
+            except Exception as e:
+                logger.warning("turn 日志按日期清理失败: %s", e)
 
     async def shutdown(self) -> None:
         """关闭所有组件"""
@@ -189,6 +280,12 @@ class SubagentOrchestrator:
 
         if self._dispatcher:
             await self._dispatcher.shutdown()
+
+        # 关闭持久化 store（DB 连接），剩余未消费的请求保留在 DB 里供下次恢复
+        try:
+            await self._pending_graph_store.close()
+        except Exception as e:
+            logger.warning("关闭 pending_graph_store 失败: %s", e)
 
         if self._event_bus:
             await self._event_bus.close()

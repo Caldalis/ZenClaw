@@ -31,9 +31,7 @@ from miniclaw.utils.logging import get_logger
 logger = get_logger(__name__)
 
 
-# subagent 隔离版本的文件/终端工具名（master 里叫 terminal_command，
-# 隔离版叫 terminal —— 这里两个都列进来，避免 master 的 terminal_command
-# 被复制到 subagent 里绕过 worktree 沙箱）
+
 ISOLATED_TOOL_NAMES: frozenset[str] = frozenset({
     "read_file", "write_file", "edit_file",
     "ls", "glob", "grep",
@@ -75,7 +73,6 @@ class SubagentConfig:
     """是否需要 Git Worktree 物理隔离"""
 
     # 验证门禁
-    # 仅产出代码的角色（CoderAgent / TesterAgent）需要 lint/tests 验证后才能提交。
     # 只读角色（ReviewerAgent / SearcherAgent / PlannerAgent）不写文件，强制验证
     # 会让它们在工具表里多出无用的 run_linter/run_tests，并在 prompt 提示下死循环
     # 试遍每种 linter。
@@ -99,6 +96,23 @@ class SubagentConfig:
     graph_id: str = ""
     """任务图 ID"""
 
+    def __post_init__(self) -> None:
+        """配置一致性校验 —— 拒绝矛盾组合，自动归一并 warn。
+
+        规则：requires_validation 蕴含 requires_worktree。
+        没有 worktree 就没有可被 run_linter/run_tests 验证的产物（验证工具
+        会在主仓根目录下找文件，找不到就死循环 ERROR）。如果调用方写了
+        requires_validation=True 但 requires_worktree=False，就强制把
+        validation 关掉，并 warn 提示。
+        """
+        if self.requires_validation and not self.requires_worktree:
+            logger.warning(
+                "矛盾配置: role=%s requires_validation=True 但 requires_worktree=False；"
+                "已自动关闭 validation（没有 worktree 无可验证产物）",
+                self.role_name,
+            )
+            self.requires_validation = False
+
     def to_spec(self) -> SubagentSpec:
         """转换为 SubagentSpec"""
         return SubagentSpec(
@@ -112,8 +126,6 @@ class SubagentConfig:
             forbidden_tools=self.forbidden_tools,
             requires_worktree=self.requires_worktree,
         )
-
-
 class SubagentFactory:
     """Subagent 工厂
 
@@ -213,6 +225,30 @@ class SubagentFactory:
             requires_worktree=merged.get("requires_worktree", False),
             requires_validation=merged.get("requires_validation", True),
         )
+    # 写代码类工具：用来推断"这个角色是不是写代码的"
+    _WRITE_TOOL_NAMES = frozenset({
+        "write_file", "edit_file", "create_file",
+    })
+
+    @classmethod
+    def _infer_requires_validation_for_dynamic_role(
+        cls,
+        allowed_tools: list[str],
+        forbidden_tools: list[str],
+    ) -> bool:
+        """推断动态角色是否应当走验证门禁。
+        """
+        forbidden_set = {t.lower() for t in (forbidden_tools or [])}
+        if cls._WRITE_TOOL_NAMES & forbidden_set:
+            # 显式禁止写 → 角色不可能写代码
+            return False
+
+        if allowed_tools:
+            allowed_set = {t.lower() for t in allowed_tools}
+            return bool(cls._WRITE_TOOL_NAMES & allowed_set)
+
+        # allowed_tools 空 相当于 全部允许 保守认为可能写代码
+        return True
 
     def _create_dynamic_config(
         self,
@@ -223,9 +259,8 @@ class SubagentFactory:
     ) -> SubagentConfig:
         """创建动态角色配置
 
-        当 Master 使用自定义角色时：
-          1. 必须有 custom_role_prompt
-          2. 动态构建专属 System Prompt
+           必须有 custom_role_prompt
+           动态构建专属 System Prompt
         """
         if not custom_role_prompt:
             logger.warning(
@@ -242,17 +277,35 @@ class SubagentFactory:
             forbidden_tools=custom_config.get("forbidden_tools"),
         )
 
+        allowed_tools = custom_config.get("allowed_tools", []) or []
+        forbidden_tools = custom_config.get("forbidden_tools", []) or []
+
+        # requires_validation：master 显式给了就用它；没给就按工具表推断
+        # （写代码 → True；只读 → False）。这样自定义只读角色（如DBSchemaReviewer）默认不会被门禁卡死。
+        if "requires_validation" in custom_config:
+            inferred_validation = bool(custom_config["requires_validation"])
+            inference_source = "显式声明"
+        else:
+            inferred_validation = self._infer_requires_validation_for_dynamic_role(
+                allowed_tools=allowed_tools,
+                forbidden_tools=forbidden_tools,
+            )
+            inference_source = "按 allowed/forbidden_tools 推断"
+        logger.info(
+            "动态角色 %s requires_validation=%s（来源：%s）",
+            role_name, inferred_validation, inference_source,
+        )
+
         return SubagentConfig(
             role_name=role_name,
             system_prompt=full_prompt,
             instruction=instruction,
-            allowed_tools=custom_config.get("allowed_tools", []),
-            forbidden_tools=custom_config.get("forbidden_tools", []),
+            allowed_tools=allowed_tools,
+            forbidden_tools=forbidden_tools,
             max_steps=custom_config.get("max_steps", 15),
             timeout_ms=custom_config.get("timeout_ms", 120000),
             requires_worktree=custom_config.get("requires_worktree", False),
-            # 动态角色默认要求验证（除非显式声明不需要），更稳妥
-            requires_validation=custom_config.get("requires_validation", True),
+            requires_validation=inferred_validation,
         )
 
     def _build_full_prompt(
@@ -292,10 +345,6 @@ class SubagentFactory:
           4. 注入 isolated_tools（隔离版文件/终端工具）
           5. 注入 extra_tools（验证工具等）
           6. 注入 submit_tool（已包装的 submit_task_result）
-
-        这一步替换了原来 task_scheduler 里散在的硬编码工具拼装，
-        并让 `CoderAgent.forbidden_tools = ["terminal"]` 等配置真正生效。
-
         Args:
             config: Subagent 配置（含 allowed_tools/forbidden_tools）
             master_tools: Master Agent 的工具实例列表
@@ -310,11 +359,23 @@ class SubagentFactory:
         forbidden = set(config.forbidden_tools or [])
 
         def _permitted(name: str) -> bool:
+            """常规工具的双向过滤（白名单非空 → 必须在白名单内；黑名单总是排他）。"""
             if forbidden and name in forbidden:
                 return False
             if allowed and name not in allowed:
                 return False
             return True
+
+        def _permitted_system_extra(name: str) -> bool:
+            """系统注入的额外工具（如 run_linter / run_tests）只走黑名单。
+
+            白名单是"角色作者列出的它会用的工具"，但 run_linter / run_tests 是
+            *系统强制*的验证工具——只要 requires_validation=True 就必须可用，
+            否则角色会陷入"prompt 让我调它，但工具表没有"的死循环。
+            CoderAgent 没有把 run_linter 写进 allowed 也属于历史失误，
+            这条规则把"列白名单时漏写系统工具"自动救回。
+            """
+            return name not in forbidden
 
         registry = ToolRegistry()
 
@@ -343,8 +404,6 @@ class SubagentFactory:
                     continue
                 registry.register(tool)
         else:
-            # 没传隔离工具 = 非 worktree 模式，保留 master 的原版文件工具
-            # 注意：此时 terminal_command 依然受 forbidden 限制
             for tool in master_tools:
                 if tool.name not in ISOLATED_TOOL_NAMES:
                     continue
@@ -352,9 +411,22 @@ class SubagentFactory:
                     continue
                 registry.register(tool)
 
-        # 5. 额外工具（验证工具等）
+        # 5. 额外工具（系统注入的验证工具等）
+        # 关键：只走 forbidden 不走 allowed —— 这些是 task_scheduler 根据
+        # requires_validation 强制下发的工具，角色 prompt 里要求调它们。
+        # 之前同时检查 allowed 导致 CoderAgent 没有把 run_linter 列进
+        # allowed_tools 时被静默剔除，agent 看到 prompt 让调 run_linter
+        # 却找不到工具，回退到 terminal 跑 flake8 → 验证门禁不识别 →
+        # 死循环。角色想*禁用*某验证工具的话，把它写进 forbidden_tools
+        # 即可（如 CoderAgent forbidden=[run_tests] 仍然有效）。
         if extra_tools:
             for tool in extra_tools:
+                if not _permitted_system_extra(tool.name):
+                    logger.debug(
+                        "subagent %s 跳过系统额外工具 %s（被 forbidden_tools 显式禁用）",
+                        config.role_name, tool.name,
+                    )
+                    continue
                 registry.register(tool)
 
         # 6. submit_task_result（无论白名单如何，子任务必须能提交结果）

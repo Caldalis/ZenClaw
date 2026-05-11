@@ -34,13 +34,15 @@ class ToolExecutor:
         tool_result_max_bytes: int = 102400,
         validation_gatekeeper: Any = None,
         tool_circuit_breaker: Any = None,
+        critic_injector: Any = None,
     ):
         self._registry = tool_registry
         self._max_bytes = tool_result_max_bytes
         self._gatekeeper = validation_gatekeeper
-        # 可选：本 Agent 局部的 CircuitBreaker，用于检测"工具结构化失败重复"
-        # （例如 run_linter 反复返回 status=error 而不抛异常）。
+        # 工具结构化失败的两个汇入点：breaker 决定是否提前终止 ReAct，
+        # critic_injector 决定下一轮 LLM 调用要附带什么警示。两者并行喂数据。
         self._tool_breaker = tool_circuit_breaker
+        self._critic_injector = critic_injector
 
     async def execute(
         self,
@@ -82,10 +84,67 @@ class ToolExecutor:
                     result_text = f"工具执行错误: {e}"
                     is_error = True
                     logger.error("工具 %s 执行失败: %s", tc.name, e, exc_info=True)
+                    # 真实异常路径同时喂给 breaker + critic，与"结构化失败"路径
+                    # 并行处理（结构化失败走 _record_validation 内部）。
+                    if self._tool_breaker is not None:
+                        try:
+                            self._tool_breaker.record_failure(e)
+                        except Exception as breaker_err:
+                            logger.debug("breaker 记录异常失败（吞掉）: %s", breaker_err)
+                    if self._critic_injector is not None:
+                        try:
+                            self._critic_injector.record_failure(
+                                tool_name=tc.name,
+                                tool_arguments=tc.arguments,
+                                error=e,
+                            )
+                        except Exception as critic_err:
+                            logger.debug("critic 记录异常失败（吞掉）: %s", critic_err)
 
                 # 记录验证工具结果到 Gatekeeper
                 if not is_error and self._gatekeeper and tc.name in ("run_linter", "run_tests"):
                     self._record_validation(tc.name, result_text)
+
+                # submit_task_result 被门禁拒绝时，本质上和"工具反复返回 ERROR"等价：
+                # 字符串里没有抛异常，所以走不到 record_failure 路径，但确实是
+                # 一个停滞模式。喂给 breaker，让它在 N 次相同拒绝后跳闸 —
+                # 没这一刀，agent 会硬撞 max_iterations 才停（日志里典型现象）。
+                if (not is_error
+                        and tc.name == "submit_task_result"
+                        and isinstance(result_text, str)
+                        and result_text.startswith("**提交被阻止**")):
+                    if self._tool_breaker is not None:
+                        try:
+                            self._tool_breaker.record_tool_failure(
+                                tool_name="submit_task_result",
+                                status="rejected_by_gatekeeper",
+                                # 把拒绝理由的前若干字节作为 message —— breaker
+                                # 用它做指纹，相同理由的拒绝会落在同一指纹上，
+                                # 触发 same_error_threshold 时熔断
+                                message=result_text[:160],
+                            )
+                        except Exception as breaker_err:
+                            logger.debug(
+                                "breaker 记录 submit 拒绝失败（吞掉）: %s",
+                                breaker_err,
+                            )
+                    if self._critic_injector is not None:
+                        try:
+                            tool_err_cls = type(
+                                "ToolResult_submit_rejected",
+                                (RuntimeError,),
+                                {},
+                            )
+                            self._critic_injector.record_failure(
+                                tool_name=tc.name,
+                                tool_arguments=tc.arguments,
+                                error=tool_err_cls(result_text[:200]),
+                            )
+                        except Exception as critic_err:
+                            logger.debug(
+                                "critic 记录 submit 拒绝失败（吞掉）: %s",
+                                critic_err,
+                            )
 
             # 工具输出截断（仅截断成功结果，错误信息通常较短）
             if not is_error:
@@ -137,11 +196,46 @@ class ToolExecutor:
         self._gatekeeper.record_validation(tool_name, result)
         logger.info("验证结果已记录: tool=%s, status=%s", tool_name, status.value)
 
-        # 把"结构化失败"喂给熔断器，让它在 N 次相同失败后跳闸
-        # （否则 agent 看到 ERROR 后会反复试，没有任何机制能打断）
-        if self._tool_breaker and status in (ValidationStatus.ERROR, ValidationStatus.FAILED):
-            self._tool_breaker.record_tool_failure(
-                tool_name=tool_name,
-                status=status.value,
-                message=data.get("message", ""),
-            )
+        # ERROR 与 FAILED 含义不同，分别处理：
+        #   - ERROR  ：工具不可用（环境问题），喂 breaker 防止死循环重试，
+        #             但**不**喂 critic_injector —— 这不是代码错误，
+        #             不应让 LLM 反思"我哪里写错了"。
+        #   - FAILED ：真实验证失败（lint 错、test 红），喂 breaker + critic。
+        #   - PASSED ：成功 → 清除 critic 上一次失败的污染，避免持续注入。
+        msg = data.get("message", "")
+        if status == ValidationStatus.ERROR:
+            if self._tool_breaker is not None:
+                self._tool_breaker.record_tool_failure(
+                    tool_name=tool_name,
+                    status=status.value,
+                    message=msg,
+                )
+        elif status == ValidationStatus.FAILED:
+            if self._tool_breaker is not None:
+                self._tool_breaker.record_tool_failure(
+                    tool_name=tool_name,
+                    status=status.value,
+                    message=msg,
+                )
+            if self._critic_injector is not None:
+                # 用动态命名的子类，让 critic_injector 拿到的 error_type 能区分
+                # 工具来源（ToolResult_run_linter / ToolResult_run_tests …）。
+                tool_err_cls = type(
+                    f"ToolResult_{tool_name}",
+                    (RuntimeError,),
+                    {},
+                )
+                synthetic_err = tool_err_cls(f"[{status.value}] {msg}")
+                self._critic_injector.record_failure(
+                    tool_name=tool_name,
+                    tool_arguments={"status": status.value},
+                    error=synthetic_err,
+                )
+        elif status == ValidationStatus.PASSED:
+            # 验证通过 → agent 已自我修复，清掉 critic 旧失败上下文，
+            # 避免后续 prompt 仍带着"你失败了"的警示。
+            if self._critic_injector is not None and self._critic_injector.has_recent_failure():
+                self._critic_injector.clear()
+                logger.debug(
+                    "验证通过，清除 critic 失败上下文: tool=%s", tool_name,
+                )

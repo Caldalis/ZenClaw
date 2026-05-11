@@ -112,8 +112,17 @@ async def bootstrap_master_subagent(config: Settings) -> dict:
 
     # 5. 基础 Agent
     from miniclaw.tools.registry import ToolRegistry
+    from miniclaw.tools.builtin.git_resolve_conflict import GitResolveConflictTool
+
+    # 显式注册 git_resolve_conflict（auto-loader 不能给它 repo_root 参数）。
+    # 工具同时进 master_tool_registry（subagent 不该用这个），通过白名单控制。
+    repo_root_for_tools = Path.cwd()
+    git_resolve_tool = GitResolveConflictTool(repo_root=repo_root_for_tools)
+    tool_registry.register(git_resolve_tool)
+    logger.info("已注册 git_resolve_conflict 工具 (master 专用)")
+
     master_view_registry = ToolRegistry()
-    master_whitelist = ("create_task_graph", "load_skill")
+    master_whitelist = ("create_task_graph", "load_skill", "git_resolve_conflict", "read_file", "ls")
     for tool_name in master_whitelist:
         tool = tool_registry.get(tool_name)
         if tool is not None:

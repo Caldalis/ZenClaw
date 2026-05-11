@@ -8,17 +8,74 @@
   - TaskGraphRequest: create_task_graph 工具的输入参数
   - TaskGraphResult: 任务图构建结果
   - DynamicRole: 动态角色定义（Master 可自定义新角色）
+  - FailureCategory: 失败分类枚举，使 Master 能基于根因决策而非自由文本
 """
 
 from __future__ import annotations
 
+import hashlib
 import uuid
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Any
 
 from pydantic import BaseModel, Field
 
 from miniclaw.types.enums import AgentRole
+
+
+class FailureCategory(str, Enum):
+    """任务失败的结构化分类 — 由 task_scheduler 根据根因填写。
+
+    Master Agent 根据分类决定下一步动作：
+      - VALIDATION_UNMET    → 不要重派同样指令；要么放宽契约，要么换角色
+      - AGENT_MAX_ITERATIONS → Agent 走入死循环；通常源于 prompt 含混，重写 instruction
+      - TIMEOUT             → 任务太重；拆得更细或加 timeout
+      - CIRCUIT_BREAKER     → 工具反复失败；不要重试同种动作
+      - DEPENDENCY_FAILED   → 上游任务失败；本任务永远跑不起来，从 DAG 摘掉
+      - WORKTREE_CREATION   → Git 隔离失败；可能是分支冲突或权限问题
+      - PROVIDER_ERROR      → AI 服务故障；通常等几秒再来
+      - UNKNOWN             → 兜底，需要人工分析日志
+    """
+
+    VALIDATION_UNMET = "validation_unmet"
+    AGENT_MAX_ITERATIONS = "agent_max_iterations"
+    TIMEOUT = "timeout"
+    CIRCUIT_BREAKER = "circuit_breaker"
+    DEPENDENCY_FAILED = "dependency_failed"
+    WORKTREE_CREATION = "worktree_creation"
+    WORKSPACE_CORRUPTED = "workspace_corrupted"
+    """worktree 在执行中段被毁/状态不一致，健康检查失败"""
+
+    SANDBOX_VIOLATION = "sandbox_violation"
+    """文件工具在不存在的 worktree 根上尝试自动建目录被拒"""
+
+    COMMIT_FAILED = "commit_failed"
+    """git commit 失败 —— 通常 hook 拒绝 / 索引锁住"""
+
+    PROVIDER_ERROR = "provider_error"
+    UNKNOWN = "unknown"
+
+    @classmethod
+    def from_error(cls, error_msg: str) -> "FailureCategory":
+        """根据错误文本启发式归类。
+        task_scheduler 在抛 DispatcherError 时会带具体语义，但兜底也要稳。"""
+        s = (error_msg or "").lower()
+        if "处理轮数超过上限" in error_msg or "max iterations" in s:
+            return cls.AGENT_MAX_ITERATIONS
+        if "timeout" in s or "超时" in error_msg:
+            return cls.TIMEOUT
+        if "熔断" in error_msg or "circuit" in s:
+            return cls.CIRCUIT_BREAKER
+        if "上游依赖" in error_msg or "dependency" in s:
+            return cls.DEPENDENCY_FAILED
+        if "worktree" in s or "git" in s:
+            return cls.WORKTREE_CREATION
+        if "provider" in s or "ai" in s and ("调用失败" in error_msg or "调用错误" in error_msg):
+            return cls.PROVIDER_ERROR
+        if "验证" in error_msg or "validation" in s or "提交被阻止" in error_msg:
+            return cls.VALIDATION_UNMET
+        return cls.UNKNOWN
 
 
 class DynamicRole(BaseModel):
@@ -40,6 +97,13 @@ class DynamicRole(BaseModel):
 
     requires_worktree: bool = False
     """是否需要 Git Worktree 物理隔离"""
+
+    requires_validation: bool | None = None
+    """提交前是否必须通过 run_linter/run_tests 验证。
+
+    None 表示 master 没显式声明，由 SubagentFactory 按 allowed_tools/forbidden_tools
+    是否含写工具自动推断（写代码 → True；只读 → False）。
+    """
 
     max_steps: int = 15
     """最大 ReAct 步数"""
@@ -149,6 +213,18 @@ class TaskGraphResult(BaseModel):
     task_errors: dict[str, str] = Field(default_factory=dict)
     """失败任务的错误详情 (task_id -> error_message)"""
 
+    task_failure_categories: dict[str, FailureCategory] = Field(default_factory=dict)
+    """失败任务的结构化分类 (task_id -> FailureCategory)。
+    Master 据此决定下一步：见 FailureCategory 文档。"""
+
+    # 双层结果：每个 task 的"系统观察 + agent 自报"。
+    # task_outcomes[id].final_status 是 task 真正的最终状态。
+    # Master 据此判定 completed_tasks vs failed_tasks，不再相信 agent 自报。
+    # （这里用 dict[str, dict] 而不是 dict[str, TaskOutcome] 是为了 pydantic
+    #  序列化兼容；具体类型在 task_outcome.py，scheduler 在填充时把它转成 dict。）
+    task_outcomes: dict[str, Any] = Field(default_factory=dict)
+    """系统观察 outcome (task_id -> TaskOutcome.to_dict 序列化形式)"""
+
     task_dependencies: dict[str, list[str]] = Field(default_factory=dict)
     """每个任务的依赖列表 (task_id -> [dep_id, ...])"""
 
@@ -161,6 +237,41 @@ class TaskGraphResult(BaseModel):
     def has_failures(self) -> bool:
         """是否有失败任务"""
         return len(self.failed_tasks) > 0
+
+
+def compute_dag_signature(request: "TaskGraphRequest") -> str:
+    """计算 DAG 的语义指纹（仅看 role + 归一化后的 instruction + 依赖拓扑）。
+
+    Master Agent 用此指纹检测"用同一张 DAG 重派失败任务"的反模式：
+      - 忽略 task.id（Master 把 'implement' 改名 'impl' 后仍命中）
+      - 忽略空白差异（连续空格/换行被规整化）
+      - **依赖关系按内容指纹表达**而不是 task.id —— 否则改名 task.id 同时
+        改 depends_on 引用就能绕过查重；这里把 task 自身先指纹化，
+        再用其他任务的指纹来表达 depends_on，达成结构相等性
+    """
+
+    def _content_fp(t: "TaskNode") -> str:
+        """单 task 的内容指纹：仅考虑 role + 归一化 instruction + custom_role_prompt。
+        不参考 task.id，因为它要在 depends_on 里被作为锚点。"""
+        normalized_instr = " ".join((t.instruction or "").split()).strip().lower()
+        custom = " ".join((t.custom_role_prompt or "").split()).strip().lower()
+        raw = f"{(t.role or '').strip()}::{normalized_instr}::{custom}"
+        return hashlib.md5(raw.encode("utf-8")).hexdigest()[:10]
+
+    # 第一遍：构建 task.id -> 内容指纹 的映射
+    id_to_fp: dict[str, str] = {t.id: _content_fp(t) for t in request.tasks}
+
+    # 第二遍：每个 task 用 (内容指纹, 依赖指纹列表) 描述
+    items: list[tuple[str, tuple[str, ...]]] = []
+    for t in request.tasks:
+        dep_fps = sorted(id_to_fp.get(dep_id, dep_id) for dep_id in t.depends_on)
+        items.append((id_to_fp[t.id], tuple(dep_fps)))
+    # 排序确保 task 顺序不影响指纹
+    items.sort()
+    serialized = "|".join(
+        f"{fp}<-{','.join(deps)}" for fp, deps in items
+    )
+    return hashlib.md5(serialized.encode("utf-8")).hexdigest()[:16]
 
 
 class ExecutionPlan(BaseModel):
@@ -316,6 +427,8 @@ def extract_dynamic_roles(tasks: list[TaskNode]) -> list[DynamicRole]:
                 allowed_tools=config.get("allowed_tools", []),
                 forbidden_tools=config.get("forbidden_tools", []),
                 requires_worktree=config.get("requires_worktree", False),
+                # None 信号：未显式声明 → 后续由 factory 智能推断
+                requires_validation=config.get("requires_validation"),
                 max_steps=config.get("max_steps", 15),
                 timeout_ms=config.get("timeout_ms", 120000),
             )

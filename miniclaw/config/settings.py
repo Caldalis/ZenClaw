@@ -84,14 +84,23 @@ class SubagentConfig(BaseModel):
     # Critic 配置
     enable_critic: bool = True            # 是否启用 Critic 警示
     enable_circuit_breaker: bool = True   # 是否启用熔断器
-    circuit_breaker_threshold: int = 3    # 熔断阈值
+    circuit_breaker_threshold: int = 3    # 任务级熔断阈值（异常路径）
+    # 工具级熔断：在 ReAct 循环内监控"工具结构化失败"，避免 agent
+    # 反复返回同一种 ERROR/FAILED 直到 max_steps 才停。
+    tool_breaker_total_threshold: int = 5    # 一次任务内累计失败工具调用上限
+    tool_breaker_same_error_threshold: int = 3  # 同一错误指纹重复阈值
 
     # 验证配置
     require_validation: bool = True       # 是否强制验证闭环
     validation_requirement: str = "any"   # any | linter | tests | both
 
     # Master Agent 循环配置
-    max_task_graph_rounds: int = 3        # 单次消息最大 DAG 创建轮数
+    max_task_graph_rounds: int = 5        # 单次消息最大 DAG 创建轮数
+
+    # Turn 日志保留窗口（天）。启动时按 created_at 清理超过该天数的所有
+    # turn 记录（含 INTERRUPTED）。0 = 禁用清理。Turn 日志只是诊断用
+    # 观察日志，过期就该删，避免 turns DB 无限增长。
+    turn_log_retention_days: int = 3
 
 
 class Settings(BaseModel):

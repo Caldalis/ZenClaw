@@ -24,6 +24,10 @@ from typing import Any, Callable
 
 from miniclaw.types.structured_result import StructuredResult, TaskStatus
 from miniclaw.types.task_graph import TaskNode
+from miniclaw.worktree.lifecycle import (
+    WorktreeCreateFailed,
+    WorktreeError,
+)
 from miniclaw.worktree.manager import (
     WorktreeInfo,
     WorktreeManager,
@@ -155,13 +159,27 @@ class WorkspaceIsolator:
                     workspace_id, workspace.worktree_path
                 )
 
-            except Exception as e:
-
+            except WorktreeError:
+                # 类化错误：直接向上抛，让调度层把 task 标为
+                # FailureCategory.WORKTREE_CREATION 失败。
+                # **不**再静默吞 + 设 is_active=False 后让任务继续 ——
+                # 那种"半残工作空间"是上次 Master 撒谎事故的根源。
                 logger.error(
-                    "创建 worktree 失败（requires_worktree=True，不降级）: id=%s, error=%s",
+                    "创建 worktree 失败 (requires_worktree=True)，向上抛: id=%s",
+                    workspace_id,
+                )
+                # 不缓存这个失败的 workspace，下次同 id 调用可重试
+                raise
+            except Exception as e:
+                # 非预期异常：包装成 WorktreeCreateFailed 让上游统一处理
+                logger.error(
+                    "创建 worktree 未预期异常: id=%s, error=%s",
                     workspace_id, e,
                 )
-                workspace.is_active = False
+                raise WorktreeCreateFailed(
+                    f"创建工作空间未预期异常 (id={workspace_id}): "
+                    f"{type(e).__name__}: {e}"
+                ) from e
 
         else:
             # 不需要 worktree，使用仓库根目录

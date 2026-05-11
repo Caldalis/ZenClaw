@@ -1,18 +1,3 @@
-"""
-主入口 — 双模式启动器
-
-启动模式:
-  1. single_agent: 单 Agent ReAct 循环（原有模式）
-  2. master_subagent: Master-Subagent 多智能体架构（新模式）
-
-启动流程:
-  1. 加载配置 (YAML + 环境变量)
-  2. 根据执行模式初始化组件
-  3. 启动 Gateway WebSocket 服务器（如果配置了 ws 通道）
-  4. 启动 CLI 通道（如果配置了 cli 通道）
-  5. 等待退出信号
-"""
-
 from __future__ import annotations
 
 import argparse

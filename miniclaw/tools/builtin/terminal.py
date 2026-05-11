@@ -19,7 +19,7 @@ class TerminalCommandSkill(Tool):
 
     @property
     def name(self) -> str:
-        return "terminal_command"
+        return "terminal"
 
     @property
     def description(self) -> str:

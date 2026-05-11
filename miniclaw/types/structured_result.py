@@ -113,12 +113,15 @@ class StructuredResult(BaseModel):
 
     def to_json(self) -> dict[str, Any]:
         """转换为 JSON 格式（用于工具返回）"""
-        return {
+        payload = {
             "status": self.status.value,
             "files_changed": self.files_changed,
             "summary": self.summary,
             "unresolved_issues": self.unresolved_issues,
         }
+        if self.details:
+            payload["details"] = self.details
+        return payload
 
 
 class ResultValidationConfig(BaseModel):

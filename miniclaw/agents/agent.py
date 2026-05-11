@@ -55,6 +55,8 @@ class Agent:
         memory_store: MemoryStore,
         memory_config: MemoryConfig | None = None,
         validation_gatekeeper: Any | None = None,
+        tool_circuit_breaker: Any | None = None,
+        critic_injector: Any | None = None,
     ):
         self._config = config
         self._providers = provider_registry
@@ -62,18 +64,11 @@ class Agent:
         self._session_mgr = session_manager
         self._memory = memory_store
 
-        # 本 Agent 局部的工具失败熔断器：检测"同一个工具反复返回结构化失败"
-        # 的死循环（比如 run_linter 连续 N 次报 ERROR）。这是一个独立于
-        # Orchestrator 级 CircuitBreaker 的"工具级"熔断，跨任务自动隔离
-        # （每个 subagent 是新 Agent 实例，breaker 跟着重建）。
-        from miniclaw.agents.critic.circuit_breaker import (
-            CircuitBreaker,
-            CircuitBreakerConfig,
-        )
-        self._tool_breaker = CircuitBreaker(CircuitBreakerConfig(
-            failure_threshold=5,
-            same_error_threshold=3,
-        ))
+        # 工具级熔断器：由调用方注入（通常是 task_scheduler 在创建 subagent 时给一个 task-scoped 的 CircuitBreaker）。这样工具失败信号自然汇入orchestrator 的统一 critic 体系，而不是 agent 自创一个孤岛
+        # 设为 None 时（如 single-agent 模式或 master 自己），不做工具级熔断
+        self._tool_breaker = tool_circuit_breaker
+        # Critic 注入器：用于在 ReAct 循环内捕获工具失败，下一轮 LLM 调用前把失败警示拼进 system prompt（ReAct 内即时反馈，非跨任务）
+        self._critic_injector = critic_injector
 
         mem_cfg = memory_config or MemoryConfig()
         self._tool_executor = ToolExecutor(
@@ -81,6 +76,7 @@ class Agent:
             tool_result_max_bytes=mem_cfg.tool_result_max_bytes,
             validation_gatekeeper=validation_gatekeeper,
             tool_circuit_breaker=self._tool_breaker,
+            critic_injector=self._critic_injector,
         )
         self._context_window = ContextWindow(config.max_context_tokens)
         self._context_guard = ContextGuard(
@@ -128,36 +124,34 @@ class Agent:
           5. 检查是否需要上下文压缩
           5. 产出事件流
         """
-        # Step 1: 保存用户消息
         await self._session_mgr.add_message(session_id, user_message)
         yield Event.thinking(session_id)
-
-        # Step 2: 获取工具 schema
         tool_schemas = self._tools.get_tool_schemas() if self._tools.tool_count > 0 else None
-
-        # Step 3: 工具调用循环
         iteration = 0
         while iteration < self._config.max_iterations:
             iteration += 1
             logger.debug("Agent 循环 #%d", iteration)
-
-            # 构建上下文
             session = await self._session_mgr.get_session(session_id)
             if session is None:
                 yield Event.error("会话不存在", session_id)
                 yield Event.done(session_id)
                 return
-
-            # 可选: 语义搜索相关记忆
             relevant = []
             if user_message.content:
                 try:
                     relevant = await self._memory.search(session_id, user_message.content, top_k=3)
                 except Exception:
                     pass
+            effective_system_prompt = self._config.system_prompt
+            if self._critic_injector and self._critic_injector.has_recent_failure():
+                warning = self._critic_injector.get_warning_prompt()
+                if warning:
+                    effective_system_prompt = (
+                        effective_system_prompt + "\n\n" + warning
+                    )
 
             context = self._context_window.build_context(
-                system_prompt=self._config.system_prompt,
+                system_prompt=effective_system_prompt,
                 messages=session.messages,
                 relevant_memories=relevant,
             )
@@ -176,8 +170,20 @@ class Agent:
             # 检查是否需要上下文压缩
             session = await self._session_mgr.get_session(session_id)
             if session and self._context_guard.should_compact(session.messages):
-                logger.info("上下文接近上限 (%d messages)，开始自动压缩...", len(session.messages))
-                await self._compact_messages(session_id, session.messages)
+                # 卡死保护：如果最近的工具调用模式是"反复同名同参",
+                # 压缩会把这段失败现场抹掉，agent 失忆后又会从头犯同样的错
+                # 推迟压缩，等熔断器把 ReAct 切断 —— 失败信号比上下文长度优先
+                if self._is_in_stuck_loop(session.messages):
+                    logger.warning(
+                        "上下文接近上限但检测到工具循环卡死模式，跳过本次压缩 "
+                        "（让熔断器/max_iterations 接管终止）"
+                    )
+                else:
+                    logger.info(
+                        "上下文接近上限 (%d messages)，开始自动压缩...",
+                        len(session.messages),
+                    )
+                    await self._compact_messages(session_id, session.messages)
 
             # 检查是否有工具调用
             if ai_message.is_tool_call():
@@ -193,7 +199,7 @@ class Agent:
                     await self._session_mgr.add_message(session_id, msg)
                 # 工具熔断检查：同一个工具反复返回结构化失败时立即终止，
                 # 不要让 agent 继续浪费迭代和上下文。
-                if self._tool_breaker.is_open:
+                if self._tool_breaker and self._tool_breaker.is_open:
                     breaker_err = self._tool_breaker.get_breaker_error()
                     logger.warning("工具熔断器已跳闸: %s", breaker_err)
                     yield Event.error(f"工具熔断: {breaker_err}", session_id)
@@ -203,14 +209,11 @@ class Agent:
                 continue
             else:
                 # 没有工具调用 → 最终回复
-                # 流式输出最终文本
                 if ai_message.content:
                     yield Event.text_delta(ai_message.content, session_id)
                     yield Event.text_done(ai_message.content, session_id)
                 yield Event.done(session_id)
                 return
-
-        # 超过最大迭代次数
         logger.warning("Agent 达到最大迭代次数 %d", self._config.max_iterations)
         yield Event.error(f"处理轮数超过上限 ({self._config.max_iterations})", session_id)
         yield Event.done(session_id)
@@ -242,9 +245,16 @@ class Agent:
                     relevant = await self._memory.search(session_id, user_message.content, top_k=3)
                 except Exception:
                     pass
+            effective_system_prompt = self._config.system_prompt
+            if self._critic_injector and self._critic_injector.has_recent_failure():
+                warning = self._critic_injector.get_warning_prompt()
+                if warning:
+                    effective_system_prompt = (
+                        effective_system_prompt + "\n\n" + warning
+                    )
 
             context = self._context_window.build_context(
-                system_prompt=self._config.system_prompt,
+                system_prompt=effective_system_prompt,
                 messages=session.messages,
                 relevant_memories=relevant,
             )
@@ -279,8 +289,14 @@ class Agent:
             # 检查是否需要上下文压缩
             session = await self._session_mgr.get_session(session_id)
             if session and self._context_guard.should_compact(session.messages):
-                logger.info("上下文接近上限，开始自动压缩...")
-                await self._compact_messages(session_id, session.messages)
+                if self._is_in_stuck_loop(session.messages):
+                    logger.warning(
+                        "上下文接近上限但检测到工具循环卡死模式，跳过本次压缩 "
+                        "（让熔断器/max_iterations 接管终止）"
+                    )
+                else:
+                    logger.info("上下文接近上限，开始自动压缩...")
+                    await self._compact_messages(session_id, session.messages)
             if ai_message.is_tool_call():
                 tool_messages, tool_events = await self._tool_executor.execute(
                     ai_message.tool_calls, session_id
@@ -289,7 +305,7 @@ class Agent:
                     yield event
                 for msg in tool_messages:
                     await self._session_mgr.add_message(session_id, msg)
-                if self._tool_breaker.is_open:
+                if self._tool_breaker and self._tool_breaker.is_open:
                     breaker_err = self._tool_breaker.get_breaker_error()
                     logger.warning("工具熔断器已跳闸: %s", breaker_err)
                     yield Event.error(f"工具熔断: {breaker_err}", session_id)
@@ -302,6 +318,37 @@ class Agent:
 
         yield Event.error(f"处理轮数超过上限 ({self._config.max_iterations})", session_id)
         yield Event.done(session_id)
+
+    def _is_in_stuck_loop(
+        self,
+        messages: list[Message],
+        window: int = 8,
+        repeat_threshold: int = 3,
+    ) -> bool:
+        """检测最近 `window` 条消息里是否出现"同名同参工具反复调用"模式。
+
+        触发条件：滑窗内某 (tool_name, frozen_args) 出现次数 >= repeat_threshold。
+        这是死循环的强信号 —— 比如 submit_task_result 被反复拒绝，或
+        run_linter 反复返回同样的 ERROR。
+
+        防御性实现：参数序列化失败时按"无参数"对待，避免拿不到真值时把
+        所有调用错合并成一桶。
+        """
+        if not messages:
+            return False
+        recent = messages[-window:]
+        counter: dict[tuple[str, str], int] = {}
+        for msg in recent:
+            for tc in (msg.tool_calls or []):
+                try:
+                    args_repr = repr(sorted((tc.arguments or {}).items()))
+                except Exception:
+                    args_repr = ""
+                key = (tc.name, args_repr)
+                counter[key] = counter.get(key, 0) + 1
+                if counter[key] >= repeat_threshold:
+                    return True
+        return False
 
     async def _compact_messages(self, session_id: str, messages: list[Message]) -> None:
         """将旧消息压缩为摘要，节省上下文 token

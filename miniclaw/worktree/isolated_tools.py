@@ -94,11 +94,29 @@ def _read_with_encoding(path: Path) -> str | None:
         except (UnicodeDecodeError, ValueError):
             continue
     return None
+def assert_sandbox_alive(worktree_root: Path | None) -> str | None:
+    """检查 worktree 根目录是否仍然存活。
 
+    返回 None = 健康，可以继续操作；返回字符串 = 错误消息，应直接返回给 agent。
 
-# --- Isolated Tools ---
+    设计动机：之前 IsolatedWriteFileTool 用 `mkdir(parents=True)` 会**自动补建
+    worktree 根目录**，掩盖上层资源管理层的失败 —— agent 在已被毁的 sandbox
+    里仍能"成功"写文件，但这些文件随后被清理消失，制造"幽灵成功"。
 
-
+    新契约：sandbox 根目录的存在性由 WorktreeManager 维护，文件工具**不允许**
+    自动建根。根不存在就直接硬失败，向上抛出"环境损坏"信号。
+    """
+    if worktree_root is None:
+        return "错误: 工作目录未设置（worktree 未初始化）"
+    if not worktree_root.exists():
+        return (
+            f"错误: 工作目录不存在: {worktree_root}\n"
+            f"这通常意味着 worktree 已被清理或从未创建成功。"
+            f"请停止当前操作 — 系统会把任务标为环境损坏。"
+        )
+    if not worktree_root.is_dir():
+        return f"错误: 工作目录路径不是目录: {worktree_root}"
+    return None
 class IsolatedReadFileTool(Tool):
     """隔离的文件读取工具 — 带行号标注、偏移/限制"""
 
@@ -144,8 +162,9 @@ class IsolatedReadFileTool(Tool):
         }
 
     async def execute(self, **kwargs: Any) -> str:
-        if self._worktree_root is None:
-            return "错误: 工作目录未设置"
+        sandbox_err = assert_sandbox_alive(self._worktree_root)
+        if sandbox_err:
+            return sandbox_err
 
         file_path = Path(kwargs.get("path", ""))
         offset = kwargs.get("offset", 1)
@@ -187,8 +206,6 @@ class IsolatedReadFileTool(Tool):
         except Exception as e:
             logger.error("读取文件失败: %s", e)
             return f"读取错误: {e}"
-
-
 class IsolatedWriteFileTool(Tool):
     """隔离的文件写入工具 — 创建或覆盖文件"""
 
@@ -232,8 +249,10 @@ class IsolatedWriteFileTool(Tool):
         }
 
     async def execute(self, **kwargs: Any) -> str:
-        if self._worktree_root is None:
-            return "错误: 工作目录未设置"
+        # 关键：进入前必须确认 worktree 根存活；不存活直接拒绝。
+        sandbox_err = assert_sandbox_alive(self._worktree_root)
+        if sandbox_err:
+            return sandbox_err
 
         file_path = Path(kwargs.get("path", ""))
         content = kwargs.get("content", "")
@@ -242,7 +261,14 @@ class IsolatedWriteFileTool(Tool):
         try:
             safe_path = validate_path(file_path, self._worktree_root)
 
-            if create_dirs:
+            if create_dirs and safe_path.parent != self._worktree_root:
+                # 只允许在 worktree 根**内部**补建子目录。
+                # safe_path 已通过 validate_path 确保在 worktree 内，所以这里parents=True 不会越界（最深也只到 worktree 根的子树）。
+                # 但额外加一道保险：parent 必须真的在 worktree 子树里。
+                try:
+                    safe_path.parent.relative_to(self._worktree_root.resolve())
+                except ValueError:
+                    return f"安全错误: 父目录 {safe_path.parent} 不在 worktree 根内"
                 safe_path.parent.mkdir(parents=True, exist_ok=True)
 
             # 异步写入
@@ -308,8 +334,9 @@ class IsolatedEditFileTool(Tool):
         }
 
     async def execute(self, **kwargs: Any) -> str:
-        if self._worktree_root is None:
-            return "错误: 工作目录未设置"
+        sandbox_err = assert_sandbox_alive(self._worktree_root)
+        if sandbox_err:
+            return sandbox_err
 
         file_path = Path(kwargs.get("path", ""))
         old_string = kwargs.get("old_string", "")
@@ -358,21 +385,16 @@ class IsolatedEditFileTool(Tool):
         except Exception as e:
             logger.error("编辑文件失败: %s", e)
             return f"编辑错误: {e}"
-
-
 class IsolatedLsTool(Tool):
     """隔离的目录列表工具"""
 
     def __init__(self, worktree_root: Path | None = None):
         self._worktree_root = worktree_root
-
     def set_worktree_root(self, root: Path) -> None:
         self._worktree_root = root
-
     @property
     def name(self) -> str:
         return "ls"
-
     @property
     def description(self) -> str:
         return (
@@ -380,7 +402,6 @@ class IsolatedLsTool(Tool):
             "recursive=true 时递归列出子目录，最大深度 4 层。"
             "路径必须在当前工作目录内。"
         )
-
     @property
     def parameters(self) -> dict[str, Any]:
         return {
@@ -399,10 +420,10 @@ class IsolatedLsTool(Tool):
             },
             "required": [],
         }
-
     async def execute(self, **kwargs: Any) -> str:
-        if self._worktree_root is None:
-            return "错误: 工作目录未设置"
+        sandbox_err = assert_sandbox_alive(self._worktree_root)
+        if sandbox_err:
+            return sandbox_err
 
         dir_path = Path(kwargs.get("path", "."))
         recursive = kwargs.get("recursive", False)
@@ -467,32 +488,26 @@ class IsolatedGlobTool(Tool):
             },
             "required": ["pattern"],
         }
-
     async def execute(self, **kwargs: Any) -> str:
-        if self._worktree_root is None:
-            return "错误: 工作目录未设置"
+        sandbox_err = assert_sandbox_alive(self._worktree_root)
+        if sandbox_err:
+            return sandbox_err
 
         pattern = kwargs.get("pattern", "")
         dir_path = Path(kwargs.get("path", "."))
 
         if not pattern:
             return "错误: 请提供 glob 模式"
-
         try:
             safe_path = validate_path(dir_path, self._worktree_root)
-
             if not safe_path.exists():
                 return f"目录不存在: {dir_path}"
-
             if not safe_path.is_dir():
                 return f"不是目录: {dir_path}"
-
             matches = sorted(safe_path.glob(pattern))
             file_matches = [m for m in matches if m.is_file()]
-
             if not file_matches:
                 return f"没有匹配 '{pattern}' 的文件"
-
             if len(file_matches) > MAX_GLOB_RESULTS:
                 file_matches = file_matches[:MAX_GLOB_RESULTS]
                 truncated = f"\n... (显示前 {MAX_GLOB_RESULTS} 个)"
@@ -501,15 +516,12 @@ class IsolatedGlobTool(Tool):
 
             lines = [str(m.relative_to(self._worktree_root)) for m in file_matches]
             return "\n".join(lines) + truncated
-
         except PathSecurityError as e:
             logger.warning("路径安全违规: %s", e)
             return f"安全错误: {e}"
         except Exception as e:
             logger.error("glob 搜索失败: %s", e)
             return f"错误: {e}"
-
-
 class IsolatedGrepTool(Tool):
     """隔离的文件内容搜索工具"""
 
@@ -564,8 +576,9 @@ class IsolatedGrepTool(Tool):
         }
 
     async def execute(self, **kwargs: Any) -> str:
-        if self._worktree_root is None:
-            return "错误: 工作目录未设置"
+        sandbox_err = assert_sandbox_alive(self._worktree_root)
+        if sandbox_err:
+            return sandbox_err
 
         pattern = kwargs.get("pattern", "")
         dir_path = Path(kwargs.get("path", "."))
@@ -659,8 +672,9 @@ class IsolatedTerminalTool(Tool):
         }
 
     async def execute(self, **kwargs: Any) -> str:
-        if self._worktree_root is None:
-            return "错误: 工作目录未设置"
+        sandbox_err = assert_sandbox_alive(self._worktree_root)
+        if sandbox_err:
+            return sandbox_err
 
         command = kwargs.get("command", "")
         timeout = kwargs.get("timeout", self._timeout)
@@ -729,10 +743,6 @@ class IsolatedTerminalTool(Tool):
             process.kill()
             raise
 
-
-# --- Helper functions (non-async, used by ls/glob/grep) ---
-
-
 def _list_flat(target: Path) -> str:
     entries = sorted(target.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
     lines = []
@@ -778,6 +788,9 @@ def _collect_isolated_files(target: Path, glob_filter: str | None) -> list[Path]
     return [f for f in files if f.is_file() and f.suffix.lower() not in BINARY_EXTENSIONS]
 
 
+
+
+
 def _is_hidden_path(path: Path) -> bool:
     for part in path.parts:
         if part in HIDDEN_DIRS:
@@ -815,11 +828,6 @@ async def _async_write(path: Path, content: str) -> None:
         path.write_text(content, encoding="utf-8")
 
     await loop.run_in_executor(None, _write)
-
-
-# --- Tool Set ---
-
-
 class IsolatedToolSet:
     """隔离工具集 — 为 Subagent 提供受限的文件操作 + 终端工具"""
 

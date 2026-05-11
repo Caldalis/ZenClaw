@@ -351,6 +351,43 @@ class TurnLogStore:
         logger.info("清理了 %d 条旧 Turn 记录", deleted)
         return deleted
 
+    async def purge_older_than(self, days: int) -> int:
+        """按日期清理 turn 记录（**所有状态**，包括 INTERRUPTED）。
+
+        与 cleanup_completed_turns 的区别：本函数不挑 status，按 created_at
+        硬切——超过 days 天的记录无差别删除。配合启动时清理使用，避免
+        INTERRUPTED 累积到上千条让 turn DB 膨胀。
+
+        Args:
+            days: 保留窗口。<=0 表示禁用清理（直接返回 0）。
+
+        Returns:
+            实际删除的行数。
+        """
+        assert self._db is not None
+        if days <= 0:
+            return 0
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        # 同步清理 event_log 里指向已删 turn 的孤儿事件
+        # turns 表无外键约束，event_log 不会级联删
+        cursor_turns = await self._db.execute(
+            "DELETE FROM turns WHERE created_at < ?",
+            (cutoff.isoformat(),),
+        )
+        deleted_turns = cursor_turns.rowcount
+        cursor_events = await self._db.execute(
+            "DELETE FROM event_log WHERE timestamp < ?",
+            (cutoff.isoformat(),),
+        )
+        deleted_events = cursor_events.rowcount
+        await self._db.commit()
+        logger.info(
+            "按日期清理 turn 记录: 保留 %d 天, 删除 turns=%d, event_log=%d",
+            days, deleted_turns, deleted_events,
+        )
+        return deleted_turns
+
     async def close(self) -> None:
         """关闭数据库连接"""
         if self._db:
