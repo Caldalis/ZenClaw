@@ -1,0 +1,27 @@
+[project]
+name = "taskweave"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "aiosqlite==0.22.1",
+    "anthropic==0.96.0",
+    "ddgs==9.14.1",
+    "httpx==0.28.1",
+    "numpy==2.4.4",
+    "openai==2.32.0",
+    "pydantic==2.13.3",
+    "pytest==9.0.2",
+    "pyyaml==6.0.3",
+    "rich==15.0.0",
+    "sqlite-vec==0.1.9",
+    "websockets==16.0",
+]
+
+[project.scripts]
+taskweave = "taskweave.main:main"
+
+[tool.setuptools]
+# 直接指定需要作为包安装的目录
+packages = ["taskweave", "skills"]
